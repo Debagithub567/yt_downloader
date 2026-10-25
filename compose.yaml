@@ -1,0 +1,64 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    environment:
+      API_INTERNAL_URL: http://api:8000
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./apps/web:/app/apps/web
+    depends_on:
+      api:
+        condition: service_started
+
+  api:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.python
+    command: uvicorn media_api.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/services/api --reload-dir /app/packages/media_core
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MEDIA_STORAGE_DIR: /data
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./services/api:/app/services/api
+      - ./packages/media_core:/app/packages/media_core
+      - media_storage:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.python
+    command: python -m media_worker.main
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MEDIA_STORAGE_DIR: /data
+    volumes:
+      - ./services/worker:/app/services/worker
+      - ./packages/media_core:/app/packages/media_core
+      - media_storage:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7.4-alpine
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis_data:/data
+
+volumes:
+  media_storage:
+  redis_data:
+

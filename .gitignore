@@ -1,0 +1,12 @@
+.env
+.env.local
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+node_modules/
+.next/
+coverage/
+.DS_Store
+

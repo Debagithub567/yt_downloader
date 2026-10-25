@@ -1,0 +1,23 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY packages/media_core packages/media_core
+COPY services/api services/api
+COPY services/worker services/worker
+RUN pip install --no-cache-dir \
+    -e ./packages/media_core \
+    -e ./services/api \
+    -e ./services/worker
+
+RUN useradd --create-home --uid 10001 app \
+    && mkdir -p /data \
+    && chown app:app /data
+USER app
+
