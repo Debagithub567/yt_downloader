@@ -1,6 +1,7 @@
 .env
 .env.local
 .venv/
+.python-runtime/
 __pycache__/
 .pytest_cache/
 *.py[cod]
