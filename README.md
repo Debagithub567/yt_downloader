@@ -1,6 +1,6 @@
 # Media Downloader
 
-A local development scaffold for a media processing application. The project accepts only media that users own or are authorized to download. Phase 1 contains the service layout, configuration contract, source-adapter interface, and a health endpoint. Media uploads, URL inspection, conversion, and downloads are not implemented yet.
+A local development scaffold for a media processing application. The project accepts only media that users own or are authorized to download. Phase 1 provides the service layout and health endpoint. Phase 2 adds a Python media inspection and processing engine; upload, job, and download API endpoints are not implemented yet.
 
 ## Run with Docker Compose
 
@@ -16,7 +16,7 @@ The Compose stack runs four services: `web`, `api`, `worker`, and `redis`. The A
 
 ## Run services on the host
 
-Node.js 22, Python 3.12, Redis, FFmpeg, and ffprobe are needed for host-based development. Copy `.env.example` to `.env` and export the values in your shell; the services do not automatically read that file.
+Node.js 22, Python 3.12 or newer, Redis, FFmpeg, and ffprobe are needed for host-based development. Copy `.env.example` to `.env` and export the values in your shell; the services do not automatically read that file.
 
 ```sh
 npm ci
@@ -31,6 +31,8 @@ source .venv/bin/activate
 pip install -e ./packages/media_core -e './services/api[test]' -e ./services/worker
 uvicorn media_api.main:app --reload
 ```
+
+On this Mac, the working project-local Python 3.13.18 interpreter is `.python-runtime/python/bin/python3.13`; use it in place of `python3.12` when recreating `.venv`. The project-local runtime is ignored by Git.
 
 To start the worker after Redis is running:
 
@@ -51,6 +53,10 @@ pytest packages/media_core/tests services/api/tests
 docker compose config
 ```
 
+## Media engine
+
+The engine is called from Python independently of the API and RQ worker. It accepts staged local uploads beneath an explicitly chosen root, or direct HTTPS URLs from exact allowlisted hostnames. It inspects streams with ffprobe, offers feasible MP4 resolutions, and produces MP4, M4A, MP3, or compatible original-audio files. See [the media engine guide](docs/media_engine.md) for exact local test commands, configuration, and limits.
+
 ## Configuration
 
 | Variable | Used by | Default | Purpose |
@@ -63,7 +69,7 @@ docker compose config
 
 ## Operational limits
 
-This is a development scaffold, not a public download service. It intentionally has no media input, processing, or delivery endpoints. Before public deployment, later phases must add allowlisted HTTPS URL handling with network protections, upload and request limits, job ownership and rate limiting, file expiry, cleanup, secure delivery, observability, and a production deployment configuration. The Compose file uses development commands and bind mounts.
+This is a development scaffold, not a public download service. The Phase 2 engine is a Python library; there are still no media input, processing, or delivery endpoints. Before public deployment, later phases must add API upload and request limits, job ownership and rate limiting, file expiry, cleanup, secure delivery, observability, and a production deployment configuration. The Compose file uses development commands and bind mounts.
 
 See [the architecture document](docs/architecture.md) for data flow, boundaries, and planned phases.
 
