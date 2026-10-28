@@ -4,6 +4,7 @@ import json
 import math
 from fractions import Fraction
 from pathlib import Path
+from collections.abc import Callable
 
 from .commands import run_command
 from .errors import ErrorCode, MediaError
@@ -39,7 +40,8 @@ def _fps(stream: dict) -> float | None:
     return None
 
 
-def inspect_file(path: Path, *, ffprobe: str = "ffprobe", timeout: float = 20) -> MediaInfo:
+def inspect_file(path: Path, *, ffprobe: str = "ffprobe", timeout: float = 20,
+                 should_cancel: Callable[[], bool] | None = None) -> MediaInfo:
     if not path.is_file():
         raise MediaError(ErrorCode.MEDIA_NOT_FOUND, "Media file was not found")
     try:
@@ -47,7 +49,7 @@ def inspect_file(path: Path, *, ffprobe: str = "ffprobe", timeout: float = 20) -
             [ffprobe, "-v", "error", "-protocol_whitelist", "file,pipe",
              "-format_whitelist", SAFE_DEMUXERS,
              "-show_format", "-show_streams", "-of", "json", "-i", str(path)],
-            timeout=timeout, failure=ErrorCode.PROBE_FAILED,
+            timeout=timeout, failure=ErrorCode.PROBE_FAILED, should_cancel=should_cancel,
         )
     except MediaError as exc:
         stderr = str(exc.details.get("stderr", ""))

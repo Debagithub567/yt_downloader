@@ -1,6 +1,6 @@
 # Media Downloader
 
-A local development scaffold for a media processing application. The project accepts only media that users own or are authorized to download. Phase 1 provides the service layout and health endpoint. Phase 2 adds a Python media inspection and processing engine; upload, job, and download API endpoints are not implemented yet.
+A local development scaffold for a media processing application. The project accepts only media that users own or are authorized to download. The API accepts media, queues conversion jobs, reports status, and serves completed output to holders of each job's capability token. The worker uses the Phase 2 media engine.
 
 ## Run with Docker Compose
 
@@ -49,7 +49,7 @@ Set `API_INTERNAL_URL=http://localhost:8000` when running the web app outside Co
 npm run lint:web
 npm run build:web
 source .venv/bin/activate
-pytest packages/media_core/tests services/api/tests
+pytest packages/media_core/tests services/api/tests services/worker/tests
 docker compose config
 ```
 
@@ -64,12 +64,13 @@ The engine is called from Python independently of the API and RQ worker. It acce
 | `API_INTERNAL_URL` | web server | `http://localhost:8000` | Server-side target for the `/api/*` rewrite. Compose uses `http://api:8000`. |
 | `REDIS_URL` | API and worker | `redis://localhost:6379/0` | Queue connection. Compose uses its private Redis service. |
 | `MEDIA_STORAGE_DIR` | API and worker | `./data` | Shared temporary media directory. Compose uses `/data`. |
+| `JOB_RETENTION_SECONDS` | API and worker | `86400` | Time to retain a terminal job and its output. |
 
 `API_INTERNAL_URL` is a trusted deployment setting. Do not set it from a user-supplied URL.
 
 ## Operational limits
 
-This is a development scaffold, not a public download service. The Phase 2 engine is a Python library; there are still no media input, processing, or delivery endpoints. Before public deployment, later phases must add API upload and request limits, job ownership and rate limiting, file expiry, cleanup, secure delivery, observability, and a production deployment configuration. The Compose file uses development commands and bind mounts.
+This is a development scaffold, not a public download service. Host-side tests cover the Phase 3 API, worker, and delivery paths; live Redis/RQ and Docker execution still need integration verification. Expired storage is recovered by worker maintenance or a later API inspection/job submission. If both stop and no new request arrives, expired files remain until one resumes. Directories with neither an expiry marker nor a deletion marker are preserved for manual review. Cancellation during a bounded source copy takes effect after that copy finishes. Public deployment still needs rate limiting, observability, and production configuration. The Compose file uses development commands and bind mounts.
 
 See [the architecture document](docs/architecture.md) for data flow, boundaries, and planned phases.
 

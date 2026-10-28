@@ -14,6 +14,7 @@ class ErrorCode(StrEnum):
     PROBE_FAILED = "probe_failed"
     FFMPEG_FAILED = "ffmpeg_failed"
     PROCESSING_TIMEOUT = "processing_timeout"
+    CANCELLED = "cancelled"
     SIZE_LIMIT_EXCEEDED = "size_limit_exceeded"
     INSUFFICIENT_DISK_SPACE = "insufficient_disk_space"
     INTERNAL_ERROR = "internal_error"

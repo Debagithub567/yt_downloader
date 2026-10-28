@@ -1,12 +1,15 @@
 """FFmpeg processing over staged, authorized media."""
 
 import errno
+import math
 import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Callable
+from time import monotonic
 
-from .commands import run_command
+from .commands import run_command, run_progress_command
 from .errors import ErrorCode, MediaError
 from .formats import OUTPUT_FORMATS, SAFE_DEMUXERS
 from .models import AudioStream, MediaInfo, ProcessRequest, ProcessingResult, VideoOption
@@ -23,11 +26,19 @@ class EngineConfig:
     max_output_bytes: int = 1024 * 1024 * 1024
     probe_timeout_seconds: float = 20
     process_timeout_seconds: float = 300
+    total_timeout_seconds: float | None = None
     ffmpeg_threads: int = 2
     video_preset: str = "veryfast"
     video_crf: int = 23
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
+
+
+def progress_percent(seconds: float, duration: float | None) -> int | None:
+    if duration is None or not math.isfinite(duration) or duration <= 0 or not math.isfinite(seconds):
+        return None
+    ratio = seconds / duration
+    return 99 if ratio >= 0.99 else max(0, int(ratio * 100))
 
 
 def video_options(media: MediaInfo, config: EngineConfig | None = None) -> tuple[VideoOption, ...]:
@@ -81,39 +92,83 @@ class MediaEngine:
         else:
             raise MediaError(ErrorCode.INVALID_SOURCE, "Output type must be video or audio")
 
-    def process(self, source: SourceAdapter, request: ProcessRequest) -> ProcessingResult:
+    def process(
+        self, source: SourceAdapter, request: ProcessRequest, *,
+        progress: Callable[[int | None, str], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> ProcessingResult:
         self._validate(request)
+        observe = progress is not None or cancelled is not None
+        cancelled = cancelled or (lambda: False)
+        deadline = (monotonic() + self.config.total_timeout_seconds
+                    if self.config.total_timeout_seconds is not None else None)
+        def check_cancelled() -> None:
+            if cancelled():
+                raise MediaError(ErrorCode.CANCELLED, "Processing was cancelled")
+            if deadline is not None and monotonic() >= deadline:
+                raise MediaError(ErrorCode.PROCESSING_TIMEOUT, "Media processing timed out")
+
+        def remaining(configured: float) -> float:
+            check_cancelled()
+            return min(configured, max(0.01, deadline - monotonic())) if deadline is not None else configured
+
+        check_cancelled()
         source.validate(request.source_reference)
+        check_cancelled()
         try:
             with self.storage.workspace(request.output_dir) as workspace:
+                check_cancelled()
+                if progress:
+                    progress(None, "staging")
                 staged = source.stage(request.source_reference, workspace)
+                check_cancelled()
+                if progress:
+                    progress(None, "inspecting")
                 media = inspect_file(
                     staged.path, ffprobe=self.config.ffprobe,
-                    timeout=self.config.probe_timeout_seconds,
+                    timeout=remaining(self.config.probe_timeout_seconds), should_cancel=cancelled,
                 )
                 args, output_format, video_action, audio_action, video_index, audio_index = self._plan(
                     staged.path, media, request,
                 )
+                check_cancelled()
                 required = min(self.config.max_output_bytes, max(16 * 1024 * 1024, staged.path.stat().st_size * 2))
                 if shutil.disk_usage(request.output_dir).free < required:
                     raise MediaError(ErrorCode.INSUFFICIENT_DISK_SPACE, "Not enough free space for output")
                 partial = workspace / "output.partial"
                 args += ["-fs", str(self.config.max_output_bytes), "-f", OUTPUT_FORMATS[output_format].muxer, str(partial)]
-                run_command(
-                    args, timeout=self.config.process_timeout_seconds,
-                    failure=ErrorCode.FFMPEG_FAILED,
-                )
+                if observe:
+                    args[1:1] = ["-progress", "pipe:1", "-stats_period", "0.5", "-nostats"]
+                    duration = media.duration_seconds
+                    if progress:
+                        progress(progress_percent(0, duration), "processing")
+                    def on_time(seconds: float) -> None:
+                        if progress:
+                            progress(progress_percent(seconds, duration), "processing")
+                    run_progress_command(
+                        args, timeout=remaining(self.config.process_timeout_seconds),
+                        on_progress=on_time, should_cancel=cancelled,
+                    )
+                else:
+                    run_command(args, timeout=remaining(self.config.process_timeout_seconds), failure=ErrorCode.FFMPEG_FAILED)
+                check_cancelled()
+                if progress:
+                    progress(None, "finalizing")
                 size = partial.stat().st_size if partial.exists() else 0
                 if size == 0:
                     raise MediaError(ErrorCode.FFMPEG_FAILED, "FFmpeg produced no output")
                 if size > self.config.max_output_bytes:
                     raise MediaError(ErrorCode.SIZE_LIMIT_EXCEEDED, "Output exceeds the size limit")
-                verified = inspect_file(partial, ffprobe=self.config.ffprobe, timeout=self.config.probe_timeout_seconds)
+                verified = inspect_file(
+                    partial, ffprobe=self.config.ffprobe,
+                    timeout=remaining(self.config.probe_timeout_seconds), should_cancel=cancelled,
+                )
                 self._verify_output(verified, request, output_format, media)
                 if verified.container != OUTPUT_FORMATS[output_format].container:
                     raise MediaError(ErrorCode.FFMPEG_FAILED, "Output container does not match the request")
                 verified = verified.model_copy(update={"title": media.title})
                 filename = f"{safe_stem(media.title)}-{uuid.uuid4().hex}.{output_format}"
+                check_cancelled()
                 final = self.storage.publish(partial, request.output_dir, filename)
                 return ProcessingResult(
                     path=final, output_format=output_format, file_size=size, media=verified,

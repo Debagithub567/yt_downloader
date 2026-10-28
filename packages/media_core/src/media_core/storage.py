@@ -1,10 +1,18 @@
 """Local result storage boundary for the current shared-volume deployment."""
 
 import os
+import hashlib
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import ContextManager, Iterator, Protocol
+from typing import BinaryIO, ContextManager, Iterator, Protocol
+
+
+def sha256_file(source: BinaryIO) -> str:
+    digest = hashlib.sha256()
+    while chunk := source.read(1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 class ResultStore(Protocol):
