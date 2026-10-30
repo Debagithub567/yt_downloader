@@ -113,12 +113,14 @@ class MemoryRedis:
 class MemoryQueue:
     def __init__(self):
         self.tasks = []
+        self.scheduled = []
 
     def __len__(self):
         return 0
 
     def enqueue_in(self, _delay, function, job_id):
         self.tasks.append((function, job_id))
+        self.scheduled.append((_delay, function, job_id))
         return SimpleNamespace(id="scheduled")
 
     def enqueue(self, function, *args, **kwargs):
@@ -139,6 +141,7 @@ def context(tmp_path, monkeypatch):
     redis = MemoryRedis()
     queue = MemoryQueue()
     monkeypatch.setattr(routes, "Queue", lambda *_args, **_kwargs: queue)
+    monkeypatch.setattr(jobs, "Queue", lambda *_args, **_kwargs: queue)
     monkeypatch.setattr(jobs.Redis, "from_url", lambda _url: redis)
     monkeypatch.setattr(jobs, "Settings", lambda: settings)
     client = TestClient(routes.create_app(redis_client=redis, settings=settings))
@@ -188,12 +191,26 @@ def test_success_publishes_before_completed_and_status_is_safe(context):
     assert output.is_file() and output.stat().st_size == current["result"]["file_size"]
     assert current["result"]["media"]["audio_streams"][0]["codec"] == "aac"
     assert not list((job_dir(context) / "output").glob(".media-job-*"))
+    delay, function, identifier = context.queue.scheduled[-1]
+    assert function == "media_worker.jobs.cleanup_job" and identifier == context.accepted["job_id"]
+    assert context.settings.job_retention_seconds - 1 <= delay.total_seconds() <= context.settings.job_retention_seconds + 1
     assert not (job_dir(context) / "input").exists()
     response = context.client.get(context.accepted["status_url"], headers={
         "authorization": f"Bearer {context.accepted['access_token']}"})
     assert response.status_code == 200
     assert response.json()["output"]["size_bytes"] == output.stat().st_size
     assert str(context.settings.media_storage_dir) not in response.text
+
+
+def test_completion_cleanup_schedule_failure_keeps_original_recovery(context, monkeypatch):
+    def unavailable(*_args, **_kwargs):
+        raise ConnectionError("injected cleanup scheduler failure")
+
+    monkeypatch.setattr(jobs, "Queue", unavailable)
+    run_job(context)
+    assert record(context)["status"] == "completed"
+    assert (job_dir(context) / ".expires").is_file()
+    assert context.queue.scheduled[-1][1] == "media_worker.jobs.cleanup_job"
 
 
 def test_real_ffmpeg_progress_precedes_completion(context, monkeypatch):

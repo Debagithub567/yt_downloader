@@ -70,7 +70,9 @@ The engine is called from Python independently of the API and RQ worker. It acce
 
 ## Operational limits
 
-This is a development scaffold, not a public download service. Host-side tests cover the Phase 3 API, worker, and delivery paths; live Redis/RQ and Docker execution still need integration verification. Expired storage is recovered by worker maintenance or a later API inspection/job submission. If both stop and no new request arrives, expired files remain until one resumes. Directories with neither an expiry marker nor a deletion marker are preserved for manual review. Cancellation during a bounded source copy takes effect after that copy finishes. Public deployment still needs rate limiting, observability, and production configuration. The Compose file uses development commands and bind mounts.
+This is a development scaffold, not a public download service. The Phase 3 API, worker, delivery, and cleanup paths have been verified with real Docker Compose, Redis, RQ, and FFmpeg using local fixtures. Expired storage is recovered by scheduled cleanup, worker maintenance, or a later API inspection/job submission. If worker activity and API inspection/job submission all stop, expired files remain until one resumes. Directories with neither an expiry marker nor a deletion marker are preserved for manual review. Cancellation during a bounded source copy takes effect after that copy finishes. Public deployment still needs rate limiting, observability, and production configuration. The Compose file uses development commands and bind mounts.
+
+See [the Phase 3 implementation and verification report](docs/PHASE_3_IMPLEMENTATION.md) for endpoints, lifecycle, settings, and test results.
 
 See [the architecture document](docs/architecture.md) for data flow, boundaries, and planned phases.
 

@@ -284,6 +284,18 @@ def _complete_published(store: JobStore, job_id: str, claim_id: str, manifest: P
             update_expiration(manifest.parent, completed["expires_epoch"])
         except OSError:
             log.exception("Could not update completed job expiry marker", extra={"job_id": job_id})
+        # The task scheduled at submission uses the worst-case queue and retry
+        # deadline. Completion starts a shorter retention window, so add its
+        # cleanup now; the original task remains a fallback if this fails.
+        try:
+            delay = max(1, int(completed["expires_epoch"] - time.time()) + 1)
+            scheduled = Queue("media", connection=store.redis).enqueue_in(
+                timedelta(seconds=delay), "media_worker.jobs.cleanup_job", job_id,
+            )
+            if scheduled is None:
+                raise RuntimeError("Completion cleanup was not scheduled")
+        except Exception:
+            log.exception("Could not schedule completion cleanup", extra={"job_id": job_id})
     return completed is not None
 
 
