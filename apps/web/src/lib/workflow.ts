@@ -45,7 +45,10 @@ export interface PollClock {
   clear(id: ReturnType<typeof setTimeout>): void;
 }
 
-const realClock: PollClock = { set: (callback, delay) => setTimeout(callback, delay), clear: clearTimeout };
+const realClock: PollClock = {
+  set: (callback, delay) => setTimeout(callback, delay),
+  clear: (id) => clearTimeout(id),
+};
 const terminal = (status: JobStatus["status"]) =>
   status === "completed" || status === "failed" || status === "cancelled";
 const expired = (status: JobStatus) => status.status === "completed" &&

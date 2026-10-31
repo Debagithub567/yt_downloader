@@ -26,9 +26,18 @@ export default function Home() {
   const sourceHeading = useRef<HTMLHeadingElement>(null);
   const inspectionHeading = useRef<HTMLHeadingElement>(null);
   const jobHeading = useRef<HTMLHeadingElement>(null);
+  const selectedFormat = useRef<HTMLInputElement>(null);
+  const focusAfterReuse = useRef(false);
   useEffect(() => { workflow.mount(); return () => workflow.dispose(); }, [workflow]);
   useEffect(() => { if (state.inspection) inspectionHeading.current?.focus(); }, [state.inspection]);
   useEffect(() => { if (state.job) jobHeading.current?.focus(); }, [state.job]);
+  useEffect(() => {
+    if (!state.job && focusAfterReuse.current) {
+      focusAfterReuse.current = false;
+      if (state.inspection && selectedFormat.current) selectedFormat.current.focus();
+      else sourceHeading.current?.focus();
+    }
+  }, [state.job, state.inspection]);
 
   const locked = state.submitting || !!state.job;
   const formats = state.inspection ? availableFormats(state.inspection) : [];
@@ -59,7 +68,7 @@ export default function Home() {
 
       <div className={`workflow-layout${state.job ? " has-job" : ""}`}>
         <div className="workflow-column">
-          <section className="panel" aria-labelledby="source-heading" aria-busy={state.inspecting}>
+          <section className="panel" aria-labelledby="source-heading">
             <div className="section-heading"><StepMark number="01" /><div>
               <p className="section-kicker">Start here</p>
               <h2 id="source-heading" ref={sourceHeading} tabIndex={-1} className="focus-heading">Choose your media</h2>
@@ -129,7 +138,7 @@ export default function Home() {
             </dl>
           </section>}
 
-          {state.inspection && <section className="panel" aria-labelledby="output-heading" aria-busy={state.submitting}>
+          {state.inspection && <section className="panel" aria-labelledby="output-heading">
             <div className="section-heading"><StepMark number="03" /><div>
               <p className="section-kicker">Your output</p>
               <h2 id="output-heading">Choose a format</h2>
@@ -140,7 +149,7 @@ export default function Home() {
                 <legend>Output format</legend>
                 <div className="format-grid">
                   {formats.map((format) => <label key={format} className="format-option" data-selected={state.format === format}>
-                    <input type="radio" name="output-format" value={format} checked={state.format === format}
+                    <input ref={state.format === format ? selectedFormat : undefined} type="radio" name="output-format" value={format} checked={state.format === format}
                       onChange={() => workflow.chooseFormat(format)} />
                     <span className="format-name">{format === "original" ? "Original" : format.toUpperCase()}</span>
                     <span className="format-help">{formatHelp[format]}</span>
@@ -173,7 +182,7 @@ export default function Home() {
           </section>}
         </div>
 
-        {state.job && <div className="job-column"><section className="panel job-panel" aria-labelledby="job-heading" aria-busy={state.downloading}>
+        {state.job && <div className="job-column"><section className="panel job-panel" aria-labelledby="job-heading">
           <div className="section-heading"><StepMark number="04" /><div>
             <p className="section-kicker">Your job</p>
             <h2 id="job-heading" ref={jobHeading} tabIndex={-1} className="focus-heading">Progress &amp; result</h2>
@@ -219,7 +228,7 @@ export default function Home() {
               onClick={() => void workflow.cancel()}>{state.cancelling ? "Cancelling…" : "Cancel job"}</button>}
             {state.pollingStopped && active && <button type="button" className="button button-secondary" onClick={() => workflow.retryStatus()}>Retry status updates</button>}
             {!active && state.inspection && (lifecycle === "failed" || lifecycle === "cancelled" || state.resultIssue) &&
-              <button type="button" className="button button-secondary" onClick={() => { workflow.reuseSource(); sourceHeading.current?.focus(); }}>Use same source</button>}
+              <button type="button" className="button button-secondary" onClick={() => { focusAfterReuse.current = true; workflow.reuseSource(); }}>Use same source</button>}
             {!active && <button type="button" className="button button-quiet" onClick={() => { workflow.startOver(); sourceHeading.current?.focus(); }}>Start another</button>}
           </div>
           {active && !state.cancelling && <p className="job-footnote">Cancel requests stop the active job; completion may win if it finishes first.</p>}
