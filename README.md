@@ -75,6 +75,7 @@ This is a development scaffold, not a public download service. The Phase 3 API, 
 See [the Phase 3 implementation and verification report](docs/PHASE_3_IMPLEMENTATION.md) for endpoints, lifecycle, settings, and test results.
 
 See [the Phase 4 typed API client guide](docs/PHASE_4_MILESTONE_A.md) for the browser contract, credential handling, and frontend verification commands.
+See [the Phase 4 submission and progress guide](docs/PHASE_4_MILESTONE_B.md) for the browser workflow and polling behavior.
 
 See [the architecture document](docs/architecture.md) for data flow, boundaries, and planned phases.
 
