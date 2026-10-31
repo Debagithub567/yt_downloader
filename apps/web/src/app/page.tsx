@@ -1,143 +1,231 @@
 "use client";
 
-import { useEffect, useMemo, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useSyncExternalStore, type ReactNode } from "react";
 import { MediaApi } from "@/lib/api/media.ts";
+import { formatDuration, formatFileSize, jobAnnouncement, jobStateLabel } from "@/lib/ui.ts";
 import { MediaWorkflow, MP3_BITRATES, availableFormats, buildSelection, type OutputFormat } from "@/lib/workflow.ts";
 
-const inputClass = "mt-2 w-full rounded-lg border border-stone-300 bg-white px-3 py-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700 disabled:bg-stone-100";
-const buttonClass = "rounded-lg bg-teal-800 px-4 py-2 font-semibold text-white hover:bg-teal-900 disabled:cursor-not-allowed disabled:opacity-50";
-const size = (bytes: number) => bytes < 1024 * 1024 ? `${Math.ceil(bytes / 1024)} KB` : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-const duration = (seconds: number | null) => seconds === null ? "Unknown" : `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
+const formatHelp: Record<OutputFormat, string> = {
+  mp4: "Video with audio when available",
+  m4a: "AAC audio",
+  mp3: "Widely supported audio",
+  original: "Copy the source audio",
+};
+
+function Detail({ term, children }: { term: string; children: ReactNode }) {
+  return <div className="detail-item"><dt>{term}</dt><dd>{children}</dd></div>;
+}
+
+function StepMark({ number }: { number: string }) {
+  return <span className="step-mark" aria-hidden="true">{number}</span>;
+}
 
 export default function Home() {
   const workflow = useMemo(() => new MediaWorkflow(new MediaApi()), []);
   const state = useSyncExternalStore(workflow.subscribe, workflow.getSnapshot, workflow.getSnapshot);
+  const sourceHeading = useRef<HTMLHeadingElement>(null);
+  const inspectionHeading = useRef<HTMLHeadingElement>(null);
+  const jobHeading = useRef<HTMLHeadingElement>(null);
   useEffect(() => { workflow.mount(); return () => workflow.dispose(); }, [workflow]);
+  useEffect(() => { if (state.inspection) inspectionHeading.current?.focus(); }, [state.inspection]);
+  useEffect(() => { if (state.job) jobHeading.current?.focus(); }, [state.job]);
 
   const locked = state.submitting || !!state.job;
   const formats = state.inspection ? availableFormats(state.inspection) : [];
   const selection = buildSelection(state);
   const lifecycle = state.status?.status ?? (state.job ? "queued" : null);
   const active = !state.resultIssue && (lifecycle === "queued" || lifecycle === "processing");
-  const expired = state.resultIssue === "expired";
-  const downloadReady = lifecycle === "completed" && !!state.status?.output && !state.resultIssue && !expired;
+  const downloadReady = lifecycle === "completed" && !!state.status?.output && !state.resultIssue;
+  const sourceError = !!state.error && !state.inspection && !state.job;
+  const sourceInputInvalid = state.error?.startsWith("Enter an HTTPS") || state.error?.startsWith("Choose a non-empty");
+  const tone = state.resultIssue || lifecycle === "failed" ? "error" : lifecycle === "completed" ? "success" : "neutral";
 
-  return <main className="mx-auto max-w-3xl space-y-8 px-5 py-10 sm:px-8 sm:py-14">
-    <header className="space-y-3">
-      <p className="text-sm font-semibold uppercase tracking-widest text-teal-800">Media Downloader</p>
-      <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">Prepare your media</h1>
-      <p className="text-stone-600">Use a supported direct HTTPS media link or a local file you are allowed to process. Website and watch-page links are not supported.</p>
-      <p className="text-sm text-stone-500">Job access stays in this page only. Refreshing or closing it loses access to an active job; you can start again here.</p>
+  return <div className="site-shell">
+    <a className="skip-link" href="#main-content">Skip to main content</a>
+    <header className="site-header">
+      <div className="site-header-inner">
+        <div className="brand"><span className="brand-mark" aria-hidden="true">M</span><span>Media Downloader</span></div>
+        <span className="header-context">Direct links &amp; local files</span>
+      </div>
     </header>
 
-    <section className="rounded-xl border border-stone-200 bg-white p-5 shadow-sm sm:p-7" aria-labelledby="source-heading">
-      <h2 id="source-heading" className="text-xl font-semibold">1. Choose a source</h2>
-      <fieldset className="mt-4 flex gap-6" disabled={locked}>
-        <legend className="sr-only">Source type</legend>
-        <label className="flex items-center gap-2"><input type="radio" name="source-mode" checked={state.mode === "url"} onChange={() => workflow.setMode("url")} />Direct URL</label>
-        <label className="flex items-center gap-2"><input type="radio" name="source-mode" checked={state.mode === "file"} onChange={() => workflow.setMode("file")} />Local file</label>
-      </fieldset>
-      {state.mode === "url" ? <div className="mt-5">
-        <label htmlFor="media-url" className="font-medium">Direct HTTPS media URL</label>
-        <input id="media-url" type="url" inputMode="url" placeholder="https://media.example.com/file.mp4" className={inputClass}
-          value={state.url} disabled={locked} onChange={(event) => workflow.setUrl(event.target.value)} />
-      </div> : <div className="mt-5">
-        <label htmlFor="media-file" className="font-medium">Media file</label>
-        <input key={state.file ? "selected" : "empty"} id="media-file" type="file" accept="video/*,audio/*" className={inputClass} disabled={locked}
-          onChange={(event) => workflow.setFile(event.target.files?.[0] ?? null)} />
-        {state.file && <p className="mt-2 text-sm text-stone-600">{state.file.name} · {size(state.file.size)}</p>}
-      </div>}
-      <div className="mt-5 flex flex-wrap items-center gap-3">
-        <button type="button" className={buttonClass} disabled={locked || state.inspecting} onClick={() => void workflow.inspect()}>{state.inspecting ? "Inspecting…" : "Inspect media"}</button>
-        {state.inspecting && <button type="button" className="rounded-lg border px-4 py-2" onClick={() => workflow.cancelInspection()}>Stop inspection</button>}
-        {!locked && (state.url || state.file) && <button type="button" className="rounded-lg border px-4 py-2" onClick={() => workflow.clearSource()}>Clear source</button>}
+    <main id="main-content" className="page-main">
+      <div className="hero">
+        <p className="eyebrow">Media conversion workspace</p>
+        <h1>Make media work in the format you need.</h1>
+        <p className="hero-lead">Inspect a direct HTTPS media file or upload a local file, choose an available output, and follow the conversion as it runs.</p>
+        <div className="privacy-note"><span className="note-dot" aria-hidden="true" />Job access stays in this page. Refreshing or closing it loses access to an active job; you can start again here.</div>
       </div>
-      {state.inspecting && <p className="mt-3 text-sm text-stone-600" role="status">Inspecting media. This may take a moment.</p>}
-    </section>
 
-    {state.error && <p role="alert" className="rounded-lg border border-red-200 bg-red-50 p-4 text-red-900">{state.error}</p>}
+      <div className={`workflow-layout${state.job ? " has-job" : ""}`}>
+        <div className="workflow-column">
+          <section className="panel" aria-labelledby="source-heading" aria-busy={state.inspecting}>
+            <div className="section-heading"><StepMark number="01" /><div>
+              <p className="section-kicker">Start here</p>
+              <h2 id="source-heading" ref={sourceHeading} tabIndex={-1} className="focus-heading">Choose your media</h2>
+              <p>Use a supported direct media URL or a file on your device.</p>
+            </div></div>
 
-    {state.inspection && <section className="rounded-xl border border-stone-200 bg-white p-5 shadow-sm sm:p-7" aria-labelledby="inspection-heading">
-      <h2 id="inspection-heading" className="text-xl font-semibold">2. Media details</h2>
-      <dl className="mt-4 grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
-        <div><dt className="text-stone-500">Title</dt><dd className="break-words font-medium">{state.inspection.media.title}</dd></div>
-        <div><dt className="text-stone-500">Duration</dt><dd className="font-medium">{duration(state.inspection.media.duration_seconds)}</dd></div>
-        <div><dt className="text-stone-500">Container</dt><dd className="font-medium">{state.inspection.media.container ?? "Unknown"}</dd></div>
-        <div><dt className="text-stone-500">Input size</dt><dd className="font-medium">{state.inspection.media.file_size === null ? "Unknown" : size(state.inspection.media.file_size)}</dd></div>
-        <div><dt className="text-stone-500">Video streams</dt><dd className="font-medium">{state.inspection.media.video_streams.map((s) => `${s.codec}${s.width && s.height ? ` ${s.width}×${s.height}` : ""}`).join(", ") || "None"}</dd></div>
-        <div><dt className="text-stone-500">Audio streams</dt><dd className="font-medium">{state.inspection.media.audio_streams.map((s) => s.codec).join(", ") || "None"}</dd></div>
-      </dl>
-      <div className="mt-6 border-t border-stone-200 pt-5">
-        <h3 className="font-semibold">3. Choose output</h3>
-        {formats.length === 0 ? <p className="mt-2 text-sm text-stone-600">This source has no supported output options.</p> : <>
-          <label htmlFor="output-format" className="mt-4 block font-medium">Format</label>
-          <select id="output-format" className={inputClass} value={state.format ?? ""} disabled={locked}
-            onChange={(event) => workflow.chooseFormat(event.target.value as OutputFormat)}>
-            {formats.map((format) => <option key={format} value={format}>{format === "original" ? "Original audio" : format.toUpperCase()}</option>)}
-          </select>
-          {state.format === "mp4" && <>
-            <label htmlFor="resolution" className="mt-4 block font-medium">Video resolution</label>
-            <select id="resolution" className={inputClass} value={state.resolution ?? ""} disabled={locked}
-              onChange={(event) => workflow.chooseResolution(Number(event.target.value))}>
-              {state.inspection.video_options.map((o) => <option key={o.resolution} value={o.resolution}>{o.resolution}p · {o.video_action}</option>)}
-            </select>
-          </>}
-          {state.format === "mp3" && <>
-            <label htmlFor="bitrate" className="mt-4 block font-medium">MP3 bitrate</label>
-            <select id="bitrate" className={inputClass} value={state.bitrate} disabled={locked}
-              onChange={(event) => workflow.chooseBitrate(Number(event.target.value))}>
-              {MP3_BITRATES.map((bitrate) => <option key={bitrate} value={bitrate}>{bitrate} kbps</option>)}
-            </select>
-          </>}
-          <button type="button" className={`${buttonClass} mt-5`} disabled={locked || !selection} onClick={() => void workflow.submit()}>{state.submitting ? "Submitting…" : "Convert media"}</button>
-          {state.submitting && <p className="mt-2 text-sm text-stone-600" role="status">Submitting your job…</p>}
-        </>}
-      </div>
-    </section>}
+            <fieldset className="source-modes" disabled={locked}>
+              <legend>Source type</legend>
+              <div className="mode-grid">
+                <label className="mode-option" data-selected={state.mode === "url"}>
+                  <input type="radio" name="source-mode" checked={state.mode === "url"} onChange={() => workflow.setMode("url")} />
+                  <span className="mode-title">Direct URL</span><span className="mode-description">HTTPS media file</span>
+                </label>
+                <label className="mode-option" data-selected={state.mode === "file"}>
+                  <input type="radio" name="source-mode" checked={state.mode === "file"} onChange={() => workflow.setMode("file")} />
+                  <span className="mode-title">Local file</span><span className="mode-description">Choose from your device</span>
+                </label>
+              </div>
+            </fieldset>
 
-    {state.job && <section className="rounded-xl border border-stone-200 bg-white p-5 shadow-sm sm:p-7" aria-labelledby="job-heading">
-      <h2 id="job-heading" className="text-xl font-semibold">Job progress</h2>
-      <div className="mt-4 space-y-2" role="status" aria-live="polite">
-        <p className="font-medium capitalize">{state.resultIssue === "missing_output" ? "File unavailable" :
-          state.resultIssue === "unauthorized" ? "Access denied" :
-          state.resultIssue === "unavailable" ? "Unavailable" :
-          state.resultIssue === "expired" ? "Expired" : lifecycle}</p>
-        <p className="text-sm text-stone-600">Stage: {(state.status?.stage ?? "queued").replaceAll("_", " ")} · Attempt {state.status?.attempt ?? 0}</p>
-        {state.status && state.status.attempt > 1 && <p className="text-sm text-amber-800">Retry attempt {state.status.attempt}{state.status.last_attempt_progress !== undefined ? ` · previous attempt reached ${state.status.last_attempt_progress}%` : ""}</p>}
-        {active && <>
-          <progress className="h-3 w-full accent-teal-700" max={100} value={state.status?.progress ?? undefined} aria-label="Job progress" />
-          <p className="text-sm text-stone-600">{state.status?.progress == null ? "Progress percentage unavailable" : `${state.status.progress}% complete`}</p>
-        </>}
-        {lifecycle === "completed" && !state.resultIssue && !expired && <p className="text-teal-800">Conversion complete. Your result is ready.</p>}
-        {lifecycle === "failed" && <p className="text-red-800">{state.status?.error?.message ?? "Processing failed."}</p>}
-        {lifecycle === "cancelled" && <p className="text-stone-700">The backend confirmed cancellation.</p>}
-        {state.cancelling && <p className="text-amber-800">Cancellation requested. Waiting for the worker to stop…</p>}
+            {state.mode === "url" ? <div className="field-block">
+              <label htmlFor="media-url" className="field-label">Direct HTTPS media URL</label>
+              <input id="media-url" className="text-input" type="url" inputMode="url" autoComplete="url"
+                placeholder="https://media.example.com/file.mp4" value={state.url} disabled={locked}
+                aria-invalid={!!sourceInputInvalid} aria-describedby={sourceError ? "source-help source-error" : "source-help"}
+                onChange={(event) => workflow.setUrl(event.target.value)} />
+              <p id="source-help" className="field-help">Link directly to a supported media file. Website and watch-page URLs are not supported.</p>
+            </div> : <div className="field-block">
+              <label htmlFor="media-file" className="field-label">Media file</label>
+              <input key={state.file ? "selected" : "empty"} id="media-file" className="file-input" type="file"
+                accept="video/*,audio/*" disabled={locked} aria-invalid={!!sourceInputInvalid}
+                aria-describedby={sourceError ? "file-help source-error" : "file-help"}
+                onChange={(event) => workflow.setFile(event.target.files?.[0] ?? null)} />
+              <p id="file-help" className="field-help">Choose an audio or video file. You can replace it before submitting a job.</p>
+              {state.file && <div className="selected-file"><span className="file-icon" aria-hidden="true">▧</span>
+                <span className="file-summary"><strong>{state.file.name}</strong><span>{formatFileSize(state.file.size)}</span></span>
+              </div>}
+            </div>}
+
+            <div className="action-row">
+              <button type="button" className="button button-primary" disabled={locked || state.inspecting}
+                onClick={() => void workflow.inspect()}>
+                {state.inspecting && <span className="button-spinner" aria-hidden="true" />}{state.inspecting ? "Inspecting media…" : "Inspect media"}
+              </button>
+              {state.inspecting && <button type="button" className="button button-secondary" onClick={() => workflow.cancelInspection()}>Stop inspection</button>}
+              {!locked && (state.url || state.file) && <button type="button" className="button button-quiet" onClick={() => workflow.clearSource()}>Clear source</button>}
+            </div>
+            {state.inspecting && <p className="inline-status" role="status">Checking this media and its available outputs…</p>}
+            {sourceError && <p id="source-error" className="notice notice-error" role="alert">{state.error}</p>}
+          </section>
+
+          {state.error && !sourceError && <p className="notice notice-error" role="alert">{state.error}</p>}
+
+          {state.inspection && <section className="panel" aria-labelledby="inspection-heading">
+            <div className="section-heading"><StepMark number="02" /><div>
+              <p className="section-kicker">Inspection complete</p>
+              <h2 id="inspection-heading" ref={inspectionHeading} tabIndex={-1} className="focus-heading">Media details</h2>
+              <p>These details come from the inspected source.</p>
+            </div></div>
+            <dl className="details-grid">
+              <Detail term="Title">{state.inspection.media.title}</Detail>
+              <Detail term="Duration">{formatDuration(state.inspection.media.duration_seconds)}</Detail>
+              <Detail term="Container">{state.inspection.media.container ?? "Unknown"}</Detail>
+              <Detail term="Input size">{state.inspection.media.file_size === null ? "Unknown" : formatFileSize(state.inspection.media.file_size)}</Detail>
+              <Detail term="Video streams">{state.inspection.media.video_streams.map((stream) => `${stream.codec}${stream.width && stream.height ? ` ${stream.width}×${stream.height}` : ""}`).join(", ") || "None"}</Detail>
+              <Detail term="Audio streams">{state.inspection.media.audio_streams.map((stream) => stream.codec).join(", ") || "None"}</Detail>
+            </dl>
+          </section>}
+
+          {state.inspection && <section className="panel" aria-labelledby="output-heading" aria-busy={state.submitting}>
+            <div className="section-heading"><StepMark number="03" /><div>
+              <p className="section-kicker">Your output</p>
+              <h2 id="output-heading">Choose a format</h2>
+              <p>Only outputs available for this source are shown.</p>
+            </div></div>
+            {formats.length === 0 ? <p className="notice notice-muted">No supported output is available for this source. Choose another file or link.</p> : <>
+              <fieldset className="format-fieldset" disabled={locked}>
+                <legend>Output format</legend>
+                <div className="format-grid">
+                  {formats.map((format) => <label key={format} className="format-option" data-selected={state.format === format}>
+                    <input type="radio" name="output-format" value={format} checked={state.format === format}
+                      onChange={() => workflow.chooseFormat(format)} />
+                    <span className="format-name">{format === "original" ? "Original" : format.toUpperCase()}</span>
+                    <span className="format-help">{formatHelp[format]}</span>
+                  </label>)}
+                </div>
+              </fieldset>
+              {state.format === "mp4" && <div className="field-block quality-field">
+                <label htmlFor="resolution" className="field-label">Video resolution</label>
+                <select id="resolution" className="select-input" value={state.resolution ?? ""} disabled={locked}
+                  onChange={(event) => workflow.chooseResolution(Number(event.target.value))}>
+                  {state.inspection.video_options.map((option) => <option key={option.resolution} value={option.resolution}>{option.resolution}p · {option.video_action}</option>)}
+                </select>
+                <p className="field-help">Available resolutions come from this media inspection.</p>
+              </div>}
+              {state.format === "mp3" && <div className="field-block quality-field">
+                <label htmlFor="bitrate" className="field-label">MP3 bitrate</label>
+                <select id="bitrate" className="select-input" value={state.bitrate} disabled={locked}
+                  onChange={(event) => workflow.chooseBitrate(Number(event.target.value))}>
+                  {MP3_BITRATES.map((bitrate) => <option key={bitrate} value={bitrate}>{bitrate} kbps</option>)}
+                </select>
+                <p className="field-help">A higher bitrate makes a larger MP3 file.</p>
+              </div>}
+              {(state.format === "m4a" || state.format === "original") && <p className="field-help quality-note">No additional quality setting is needed for this output.</p>}
+              <div className="output-action"><button type="button" className="button button-primary" disabled={locked || !selection}
+                onClick={() => void workflow.submit()}>
+                {state.submitting && <span className="button-spinner" aria-hidden="true" />}{state.submitting ? "Submitting job…" : "Convert media"}
+              </button><p>Conversion begins after the job is accepted.</p></div>
+              {state.submitting && <p className="inline-status" role="status">Submitting your job…</p>}
+            </>}
+          </section>}
+        </div>
+
+        {state.job && <div className="job-column"><section className="panel job-panel" aria-labelledby="job-heading" aria-busy={state.downloading}>
+          <div className="section-heading"><StepMark number="04" /><div>
+            <p className="section-kicker">Your job</p>
+            <h2 id="job-heading" ref={jobHeading} tabIndex={-1} className="focus-heading">Progress &amp; result</h2>
+            <p>Follow the job until the backend confirms its outcome.</p>
+          </div></div>
+          <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">{jobAnnouncement(state)}</p>
+          <div className="job-summary">
+            <span className="state-badge" data-tone={tone}>{jobStateLabel(state)}</span>
+            <div className="job-stage"><span>Current stage</span><strong>{(state.status?.stage ?? "queued").replaceAll("_", " ")}</strong></div>
+            <div className="job-stage"><span>Attempt</span><strong>{state.status?.attempt ?? 0}</strong></div>
+          </div>
+          {state.status && state.status.attempt > 1 && <p className="retry-note">Retry attempt {state.status.attempt}{state.status.last_attempt_progress !== undefined ? ` · previous attempt reached ${state.status.last_attempt_progress}%` : ""}</p>}
+          {active && <div className="progress-block">
+            <div className="progress-label"><span>Conversion progress</span><strong>{state.status?.progress == null ? "In progress" : `${state.status.progress}%`}</strong></div>
+            <progress max={100} value={state.status?.progress ?? undefined} aria-label="Conversion progress"
+              aria-valuetext={state.status?.progress == null ? "Progress percentage unavailable" : undefined} />
+            {state.status?.progress == null && <p className="field-help">The backend has not reported a percentage for this stage.</p>}
+          </div>}
+          {lifecycle === "completed" && !state.resultIssue && <p className="notice notice-success">Conversion complete. Your result is ready.</p>}
+          {lifecycle === "failed" && <p className="notice notice-error" role="alert">{state.status?.error?.message ?? "Processing failed."}</p>}
+          {lifecycle === "cancelled" && <p className="notice notice-muted">The backend confirmed cancellation.</p>}
+          {state.cancelling && <p className="notice notice-warning">Cancellation requested. Waiting for the worker to stop…</p>}
+          {state.status?.status === "completed" && state.status.output && <div className="result-card">
+            <h3>Completed result</h3>
+            <dl className="details-grid result-details">
+              <Detail term="Format">{state.status.output.format.toUpperCase()}</Detail>
+              <Detail term="File size">{formatFileSize(state.status.output.size_bytes)}</Detail>
+              <Detail term="Filename">{state.downloadedFilename ?? "Provided when downloaded"}</Detail>
+              <Detail term="Available until">{new Date(state.status.expires_at).toLocaleString()}</Detail>
+            </dl>
+          </div>}
+          {state.resultIssue === "expired" && !state.downloadError && <p className="notice notice-error" role="alert">This result has expired. Start a new job.</p>}
+          {state.downloadError && <p className="notice notice-error" role="alert">{state.downloadError}</p>}
+          {state.pollingError && <p className="notice notice-error" role="alert">{state.pollingError}</p>}
+          {state.downloading && <p className="inline-status" role="status">Downloading your result…</p>}
+          {state.downloadedFilename && !state.downloadError && <p className="inline-status" role="status">Download started: {state.downloadedFilename}</p>}
+          <div className="job-actions">
+            {downloadReady && <button type="button" className="button button-primary" disabled={state.downloading}
+              onClick={() => void workflow.download()}>
+              {state.downloading && <span className="button-spinner" aria-hidden="true" />}{state.downloading ? "Downloading…" : "Download result"}
+            </button>}
+            {active && <button type="button" className="button button-danger" disabled={state.cancelling}
+              onClick={() => void workflow.cancel()}>{state.cancelling ? "Cancelling…" : "Cancel job"}</button>}
+            {state.pollingStopped && active && <button type="button" className="button button-secondary" onClick={() => workflow.retryStatus()}>Retry status updates</button>}
+            {!active && state.inspection && (lifecycle === "failed" || lifecycle === "cancelled" || state.resultIssue) &&
+              <button type="button" className="button button-secondary" onClick={() => { workflow.reuseSource(); sourceHeading.current?.focus(); }}>Use same source</button>}
+            {!active && <button type="button" className="button button-quiet" onClick={() => { workflow.startOver(); sourceHeading.current?.focus(); }}>Start another</button>}
+          </div>
+          {active && !state.cancelling && <p className="job-footnote">Cancel requests stop the active job; completion may win if it finishes first.</p>}
+        </section></div>}
       </div>
-      {state.status?.status === "completed" && state.status.output && <div className="mt-5 rounded-lg bg-stone-50 p-4">
-        <h3 className="font-semibold">Completed result</h3>
-        <dl className="mt-3 grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
-          <div><dt className="text-stone-500">Format</dt><dd className="font-medium uppercase">{state.status.output.format}</dd></div>
-          <div><dt className="text-stone-500">File size</dt><dd className="font-medium">{size(state.status.output.size_bytes)}</dd></div>
-          <div><dt className="text-stone-500">Filename</dt><dd className="break-words font-medium">{state.downloadedFilename ?? "Provided when downloaded"}</dd></div>
-          <div><dt className="text-stone-500">Available until</dt><dd className="font-medium">{new Date(state.status.expires_at).toLocaleString()}</dd></div>
-        </dl>
-      </div>}
-      {expired && !state.downloadError && <p role="alert" className="mt-4 text-sm text-red-800">This result has expired. Start a new job.</p>}
-      {state.downloadError && <p role="alert" className="mt-4 text-sm text-red-800">{state.downloadError}</p>}
-      {state.downloading && <p role="status" className="mt-4 text-sm text-stone-600">Downloading your result…</p>}
-      {state.downloadedFilename && !state.downloadError && <p role="status" className="mt-4 text-sm text-teal-800">Download started: {state.downloadedFilename}</p>}
-      {state.pollingError && <p role="alert" className="mt-4 text-sm text-red-800">{state.pollingError}</p>}
-      <div className="mt-5 flex flex-wrap items-center gap-3">
-        {downloadReady && <button type="button" className={buttonClass} disabled={state.downloading}
-          onClick={() => void workflow.download()}>{state.downloading ? "Downloading…" : "Download result"}</button>}
-        {active && <button type="button" className="rounded-lg border border-red-700 px-4 py-2 font-semibold text-red-800 disabled:opacity-50"
-          disabled={state.cancelling} onClick={() => void workflow.cancel()}>{state.cancelling ? "Cancelling…" : "Cancel job"}</button>}
-        {state.pollingStopped && active && <button type="button" className={buttonClass} onClick={() => workflow.retryStatus()}>Retry status updates</button>}
-        {!active && state.inspection && (lifecycle === "failed" || lifecycle === "cancelled" || state.resultIssue) &&
-          <button type="button" className="rounded-lg border border-teal-800 px-4 py-2 font-semibold text-teal-800" onClick={() => workflow.reuseSource()}>Use same source</button>}
-        {(!active || expired) && <button type="button" className="rounded-lg border border-stone-400 px-4 py-2 font-semibold" onClick={() => workflow.startOver()}>Start another</button>}
-      </div>
-      {active && !state.cancelling && <p className="mt-2 text-xs text-stone-500">Cancel requests stop the active job; completion may win if it finishes first.</p>}
-    </section>}
-  </main>;
+    </main>
+    <footer className="site-footer">Process media you own or have permission to use.</footer>
+  </div>;
 }
