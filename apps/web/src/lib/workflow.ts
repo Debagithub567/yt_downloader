@@ -1,9 +1,11 @@
 import { ApiError } from "./api/errors.ts";
 import type { AcceptedJob, InspectedSource, JobSelection, JobStatus } from "./api/types.ts";
-import type { MediaApi } from "./api/media.ts";
+import { saveDownloadedResult, type MediaApi } from "./api/media.ts";
+import type { DownloadedResult } from "./api/types.ts";
 
 export type SourceMode = "url" | "file";
 export type OutputFormat = JobSelection["output_format"];
+export type ResultIssue = "expired" | "missing_output" | "unauthorized" | "unavailable" | null;
 export const MP3_BITRATES = [128, 192, 320] as const; // media_core.engine.EngineConfig
 const COPYABLE_AUDIO = new Set(["aac", "mp3", "flac", "vorbis", "opus", "pcm_s16le"]);
 
@@ -23,6 +25,10 @@ export interface WorkflowState {
   error: string | null;
   pollingError: string | null;
   pollingStopped: boolean;
+  downloading: boolean;
+  downloadError: string | null;
+  resultIssue: ResultIssue;
+  downloadedFilename: string | null;
 }
 
 export interface WorkflowApi {
@@ -31,6 +37,7 @@ export interface WorkflowApi {
   createJob: MediaApi["createJob"];
   getJobStatus: MediaApi["getJobStatus"];
   cancelJob: MediaApi["cancelJob"];
+  downloadJob: MediaApi["downloadJob"];
 }
 
 export interface PollClock {
@@ -41,6 +48,28 @@ export interface PollClock {
 const realClock: PollClock = { set: (callback, delay) => setTimeout(callback, delay), clear: clearTimeout };
 const terminal = (status: JobStatus["status"]) =>
   status === "completed" || status === "failed" || status === "cancelled";
+const expired = (status: JobStatus) => status.status === "completed" &&
+  Number.isFinite(Date.parse(status.expires_at)) && Date.parse(status.expires_at) <= Date.now();
+
+export function resultError(error: unknown): { issue: ResultIssue; message: string } {
+  if (!(error instanceof ApiError)) return { issue: null, message: "The download could not be completed. Try again." };
+  if (error.kind === "missing_capability" || error.status === 401 || error.status === 403) {
+    return { issue: "unauthorized", message: "Access to this download was denied. Start a new job." };
+  }
+  if (error.status === 410 && error.message === "Completed file is unavailable") {
+    return { issue: "missing_output", message: "The completed file is no longer available. Start a new job." };
+  }
+  if (error.status === 410) return { issue: "expired", message: "This result has expired. Start a new job." };
+  if (error.status === 404) return { issue: "unavailable", message: "This result is unavailable or expired, or its access key is invalid. Start a new job." };
+  if (error.status === 409) return { issue: "unavailable", message: "The result is no longer ready for download. Start a new job." };
+  if (error.status === 503 || error.status === 500 || error.status === 504) {
+    return { issue: null, message: "The media service is temporarily unavailable. Try the download again." };
+  }
+  if (error.kind === "network" || error.kind === "timeout" || error.kind === "aborted") {
+    return { issue: null, message: "The download was interrupted. Check your connection and try again." };
+  }
+  return { issue: null, message: error.message };
+}
 
 export function availableFormats(source: InspectedSource): OutputFormat[] {
   return [
@@ -82,7 +111,8 @@ export class MediaWorkflow {
     mode: "url", url: "", file: null, inspecting: false, submitting: false,
     cancelling: false, inspection: null, format: null, resolution: null,
     bitrate: 192, job: null, status: null, error: null, pollingError: null,
-    pollingStopped: false,
+    pollingStopped: false, downloading: false, downloadError: null,
+    resultIssue: null, downloadedFilename: null,
   };
   private readonly listeners = new Set<() => void>();
   private sourceVersion = 0;
@@ -90,16 +120,20 @@ export class MediaWorkflow {
   private inspectionController: AbortController | null = null;
   private statusController: AbortController | null = null;
   private cancelController: AbortController | null = null;
+  private downloadController: AbortController | null = null;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private polling = false;
   private pollFailures = 0;
   private active = true;
   private readonly api: WorkflowApi;
   private readonly clock: PollClock;
+  private readonly saveResult: (result: DownloadedResult) => void;
 
-  constructor(api: WorkflowApi, clock: PollClock = realClock) {
+  constructor(api: WorkflowApi, clock: PollClock = realClock,
+              saveResult: (result: DownloadedResult) => void = saveDownloadedResult) {
     this.api = api;
     this.clock = clock;
+    this.saveResult = saveResult;
   }
 
   getSnapshot = (): WorkflowState => this.state;
@@ -117,6 +151,7 @@ export class MediaWorkflow {
     this.inspectionController?.abort();
     this.statusController?.abort();
     this.cancelController?.abort();
+    this.downloadController?.abort();
     this.clearPoll();
   }
 
@@ -220,7 +255,8 @@ export class MediaWorkflow {
     try {
       const job = await this.api.createJob(source, selection);
       if (!this.active || version !== this.jobVersion) return;
-      this.set({ job, status: null, pollingStopped: false });
+      this.set({ job, status: null, pollingStopped: false, resultIssue: null,
+        downloadError: null, downloadedFilename: null });
       this.schedulePoll(0);
     } catch (error) {
       if (this.active && version === this.jobVersion) this.set({ error: message(error) });
@@ -258,9 +294,16 @@ export class MediaWorkflow {
       const status = await this.api.getJobStatus(job, { signal: controller.signal });
       if (!this.active || version !== this.jobVersion) return;
       this.pollFailures = 0;
-      this.set({ status, pollingError: null, cancelling: terminal(status.status) ? false : this.state.cancelling });
+      this.set({ status, pollingError: null, cancelling: terminal(status.status) ? false : this.state.cancelling,
+        resultIssue: expired(status) ? "expired" : status.status === "completed" ? this.state.resultIssue : null });
     } catch (error) {
       if (!this.active || version !== this.jobVersion || controller.signal.aborted) return;
+      if (error instanceof ApiError && (error.status === 410 || error.status === 404)) {
+        const issue = resultError(error);
+        this.set({ resultIssue: issue.issue, downloadError: issue.message,
+          pollingError: null, pollingStopped: true, cancelling: false });
+        return;
+      }
       this.pollFailures++;
       if (this.pollFailures >= 5) {
         this.set({ pollingError: "Status updates paused after repeated errors. Retry to continue.", pollingStopped: true });
@@ -296,7 +339,8 @@ export class MediaWorkflow {
       const status = await this.api.cancelJob(job, { signal: controller.signal });
       if (!this.active || version !== this.jobVersion) return;
       this.pollFailures = 0;
-      this.set({ status, cancelling: !terminal(status.status), pollingStopped: false, pollingError: null });
+      this.set({ status, cancelling: !terminal(status.status), pollingStopped: false, pollingError: null,
+        resultIssue: expired(status) ? "expired" : null });
     } catch (error) {
       if (this.active && version === this.jobVersion) {
         this.set({ cancelling: false, error: message(error), pollingStopped: false });
@@ -307,17 +351,70 @@ export class MediaWorkflow {
     }
   }
 
+  async download(): Promise<void> {
+    const { job, status } = this.state;
+    if (!job || !status || status.status !== "completed" || !status.output ||
+        this.state.downloading || this.state.resultIssue) return;
+    if (expired(status)) {
+      this.set({ resultIssue: "expired", downloadError: "This result has expired. Start a new job." });
+      return;
+    }
+    const version = this.jobVersion;
+    const controller = new AbortController();
+    this.downloadController = controller;
+    this.set({ downloading: true, downloadError: null, downloadedFilename: null });
+    try {
+      const result = await this.api.downloadJob(job, {
+        signal: controller.signal, expectedSizeBytes: status.output.size_bytes,
+      });
+      if (!this.active || version !== this.jobVersion || controller.signal.aborted) return;
+      this.saveResult(result);
+      this.set({ downloadedFilename: result.filename });
+    } catch (error) {
+      if (this.active && version === this.jobVersion && !controller.signal.aborted) {
+        const failure = resultError(error);
+        this.set({ resultIssue: failure.issue, downloadError: failure.message });
+      }
+    } finally {
+      if (this.downloadController === controller) this.downloadController = null;
+      if (this.active && version === this.jobVersion) this.set({ downloading: false });
+    }
+  }
+
   startOver(): void {
     if (this.state.submitting || this.state.cancelling ||
-        (this.state.job && (!this.state.status || !terminal(this.state.status.status)))) return;
+        (this.state.job && !this.state.resultIssue &&
+          (!this.state.status || !terminal(this.state.status.status)))) return;
     this.jobVersion++;
     this.sourceVersion++;
     this.inspectionController?.abort();
     this.statusController?.abort();
+    this.downloadController?.abort();
     this.clearPoll();
     this.pollFailures = 0;
     this.set({ mode: "url", url: "", file: null, inspecting: false, submitting: false,
       cancelling: false, inspection: null, format: null, resolution: null, bitrate: 192,
-      job: null, status: null, error: null, pollingError: null, pollingStopped: false });
+      job: null, status: null, error: null, pollingError: null, pollingStopped: false,
+      downloading: false, downloadError: null, resultIssue: null, downloadedFilename: null });
+  }
+
+  reuseSource(): void {
+    if (!this.state.inspection || this.state.submitting || this.state.cancelling ||
+        (this.state.job && !this.state.resultIssue &&
+          (!this.state.status || !terminal(this.state.status.status)))) return;
+    this.jobVersion++;
+    this.statusController?.abort();
+    this.downloadController?.abort();
+    this.clearPoll();
+    this.pollFailures = 0;
+    const sourceExpiry = Date.parse(this.state.inspection.expires_at);
+    const sourceExpired = !Number.isFinite(sourceExpiry) || sourceExpiry <= Date.now();
+    this.set({ job: null, status: null, submitting: false, cancelling: false,
+      pollingStopped: false, pollingError: null, downloading: false, downloadError: null,
+      resultIssue: null, downloadedFilename: null,
+      inspection: sourceExpired ? null : this.state.inspection,
+      format: sourceExpired ? null : this.state.format,
+      resolution: sourceExpired ? null : this.state.resolution,
+      error: sourceExpired ? "Source access expired. Inspect the media again." : null });
   }
 }

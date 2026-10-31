@@ -4,6 +4,7 @@ import type { AcceptedJob, DownloadedResult, InspectedSource, JobCapability, Job
 import { parseAcceptedJob, parseInspectedSource, parseJobStatus } from "./validation.ts";
 
 export type RequestControl = Pick<ApiRequestOptions, "signal" | "timeoutMs">;
+export type DownloadControl = RequestControl & { expectedSizeBytes?: number };
 
 const IDENTIFIER = /^[0-9a-f]{32}$/;
 const TOKEN = /^[A-Za-z0-9_-]+$/;
@@ -102,18 +103,26 @@ export class MediaApi {
     return result;
   }
 
-  async downloadJob(job: JobCapability, control: RequestControl = {}): Promise<DownloadedResult> {
+  async downloadJob(job: JobCapability, control: DownloadControl = {}): Promise<DownloadedResult> {
+    const expected = control.expectedSizeBytes;
+    if (expected !== undefined && (!Number.isSafeInteger(expected) || expected <= 0)) {
+      throw apiFailure.invalidRequest();
+    }
     return this.client.response(jobPath(job, "/download"), {
       headers: authorization(job), signal: control.signal, timeoutMs: control.timeoutMs,
     }, async (response) => {
       const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
       if (!contentType || !(contentType in MEDIA_TYPES)) throw apiFailure.invalidResponse();
+      const length = response.headers.get("content-length");
+      if (expected !== undefined && (length === null || !/^\d+$/.test(length) || Number(length) !== expected)) {
+        throw apiFailure.invalidResponse();
+      }
       const blob = await response.blob();
       if (blob.size === 0) throw apiFailure.invalidResponse();
-      const length = response.headers.get("content-length");
       if (length !== null && (!/^\d+$/.test(length) || Number(length) !== blob.size)) {
         throw apiFailure.invalidResponse();
       }
+      if (expected !== undefined && blob.size !== expected) throw apiFailure.invalidResponse();
       const fallback = `download-${job.job_id}.${MEDIA_TYPES[contentType]}`;
       return {
         blob, filename: downloadFilename(response.headers.get("content-disposition"), fallback),

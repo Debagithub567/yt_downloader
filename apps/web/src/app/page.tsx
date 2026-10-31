@@ -18,13 +18,16 @@ export default function Home() {
   const formats = state.inspection ? availableFormats(state.inspection) : [];
   const selection = buildSelection(state);
   const lifecycle = state.status?.status ?? (state.job ? "queued" : null);
-  const active = lifecycle === "queued" || lifecycle === "processing";
+  const active = !state.resultIssue && (lifecycle === "queued" || lifecycle === "processing");
+  const expired = state.resultIssue === "expired";
+  const downloadReady = lifecycle === "completed" && !!state.status?.output && !state.resultIssue && !expired;
 
   return <main className="mx-auto max-w-3xl space-y-8 px-5 py-10 sm:px-8 sm:py-14">
     <header className="space-y-3">
       <p className="text-sm font-semibold uppercase tracking-widest text-teal-800">Media Downloader</p>
       <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">Prepare your media</h1>
       <p className="text-stone-600">Use a supported direct HTTPS media link or a local file you are allowed to process. Website and watch-page links are not supported.</p>
+      <p className="text-sm text-stone-500">Job access stays in this page only. Refreshing or closing it loses access to an active job; you can start again here.</p>
     </header>
 
     <section className="rounded-xl border border-stone-200 bg-white p-5 shadow-sm sm:p-7" aria-labelledby="source-heading">
@@ -95,24 +98,44 @@ export default function Home() {
     {state.job && <section className="rounded-xl border border-stone-200 bg-white p-5 shadow-sm sm:p-7" aria-labelledby="job-heading">
       <h2 id="job-heading" className="text-xl font-semibold">Job progress</h2>
       <div className="mt-4 space-y-2" role="status" aria-live="polite">
-        <p className="font-medium capitalize">{lifecycle}</p>
+        <p className="font-medium capitalize">{state.resultIssue === "missing_output" ? "File unavailable" :
+          state.resultIssue === "unauthorized" ? "Access denied" :
+          state.resultIssue === "unavailable" ? "Unavailable" :
+          state.resultIssue === "expired" ? "Expired" : lifecycle}</p>
         <p className="text-sm text-stone-600">Stage: {(state.status?.stage ?? "queued").replaceAll("_", " ")} · Attempt {state.status?.attempt ?? 0}</p>
         {state.status && state.status.attempt > 1 && <p className="text-sm text-amber-800">Retry attempt {state.status.attempt}{state.status.last_attempt_progress !== undefined ? ` · previous attempt reached ${state.status.last_attempt_progress}%` : ""}</p>}
         {active && <>
           <progress className="h-3 w-full accent-teal-700" max={100} value={state.status?.progress ?? undefined} aria-label="Job progress" />
           <p className="text-sm text-stone-600">{state.status?.progress == null ? "Progress percentage unavailable" : `${state.status.progress}% complete`}</p>
         </>}
-        {lifecycle === "completed" && <p className="text-teal-800">Conversion complete. Download controls will be added in the next milestone.</p>}
+        {lifecycle === "completed" && !state.resultIssue && !expired && <p className="text-teal-800">Conversion complete. Your result is ready.</p>}
         {lifecycle === "failed" && <p className="text-red-800">{state.status?.error?.message ?? "Processing failed."}</p>}
         {lifecycle === "cancelled" && <p className="text-stone-700">The backend confirmed cancellation.</p>}
         {state.cancelling && <p className="text-amber-800">Cancellation requested. Waiting for the worker to stop…</p>}
       </div>
+      {state.status?.status === "completed" && state.status.output && <div className="mt-5 rounded-lg bg-stone-50 p-4">
+        <h3 className="font-semibold">Completed result</h3>
+        <dl className="mt-3 grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
+          <div><dt className="text-stone-500">Format</dt><dd className="font-medium uppercase">{state.status.output.format}</dd></div>
+          <div><dt className="text-stone-500">File size</dt><dd className="font-medium">{size(state.status.output.size_bytes)}</dd></div>
+          <div><dt className="text-stone-500">Filename</dt><dd className="break-words font-medium">{state.downloadedFilename ?? "Provided when downloaded"}</dd></div>
+          <div><dt className="text-stone-500">Available until</dt><dd className="font-medium">{new Date(state.status.expires_at).toLocaleString()}</dd></div>
+        </dl>
+      </div>}
+      {expired && !state.downloadError && <p role="alert" className="mt-4 text-sm text-red-800">This result has expired. Start a new job.</p>}
+      {state.downloadError && <p role="alert" className="mt-4 text-sm text-red-800">{state.downloadError}</p>}
+      {state.downloading && <p role="status" className="mt-4 text-sm text-stone-600">Downloading your result…</p>}
+      {state.downloadedFilename && !state.downloadError && <p role="status" className="mt-4 text-sm text-teal-800">Download started: {state.downloadedFilename}</p>}
       {state.pollingError && <p role="alert" className="mt-4 text-sm text-red-800">{state.pollingError}</p>}
       <div className="mt-5 flex flex-wrap items-center gap-3">
+        {downloadReady && <button type="button" className={buttonClass} disabled={state.downloading}
+          onClick={() => void workflow.download()}>{state.downloading ? "Downloading…" : "Download result"}</button>}
         {active && <button type="button" className="rounded-lg border border-red-700 px-4 py-2 font-semibold text-red-800 disabled:opacity-50"
           disabled={state.cancelling} onClick={() => void workflow.cancel()}>{state.cancelling ? "Cancelling…" : "Cancel job"}</button>}
         {state.pollingStopped && active && <button type="button" className={buttonClass} onClick={() => workflow.retryStatus()}>Retry status updates</button>}
-        {!active && <button type="button" className={buttonClass} onClick={() => workflow.startOver()}>Start another</button>}
+        {!active && state.inspection && (lifecycle === "failed" || lifecycle === "cancelled" || state.resultIssue) &&
+          <button type="button" className="rounded-lg border border-teal-800 px-4 py-2 font-semibold text-teal-800" onClick={() => workflow.reuseSource()}>Use same source</button>}
+        {(!active || expired) && <button type="button" className="rounded-lg border border-stone-400 px-4 py-2 font-semibold" onClick={() => workflow.startOver()}>Start another</button>}
       </div>
       {active && !state.cancelling && <p className="mt-2 text-xs text-stone-500">Cancel requests stop the active job; completion may win if it finishes first.</p>}
     </section>}

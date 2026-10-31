@@ -76,6 +76,7 @@ See [the Phase 3 implementation and verification report](docs/PHASE_3_IMPLEMENTA
 
 See [the Phase 4 typed API client guide](docs/PHASE_4_MILESTONE_A.md) for the browser contract, credential handling, and frontend verification commands.
 See [the Phase 4 submission and progress guide](docs/PHASE_4_MILESTONE_B.md) for the browser workflow and polling behavior.
+See [the Phase 4 secure download guide](docs/PHASE_4_MILESTONE_C.md) for result delivery and browser memory limits.
 
 See [the architecture document](docs/architecture.md) for data flow, boundaries, and planned phases.
 
