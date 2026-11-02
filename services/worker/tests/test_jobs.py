@@ -3,8 +3,10 @@
 import importlib
 import inspect
 import json
+import shutil
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +21,9 @@ from media_core.engine import MediaEngine
 import media_core.engine as engine_module
 from media_core.errors import ErrorCode, MediaError
 from media_core.jobs import JobStore
+from media_core.platforms import normalize_metadata
 from media_core.settings import Settings
+from media_core.sources import StagedMedia
 from media_core.storage import LocalResultStore
 from media_worker import jobs, main as worker_main
 
@@ -167,6 +171,44 @@ def job_dir(context):
 
 def run_job(context):
     jobs.process_media_job(context.accepted["job_id"])
+
+
+def make_platform_job(context):
+    class Inspector:
+        def inspect(self, source, *, max_metadata_bytes, timeout_seconds):
+            assert max_metadata_bytes > 0 and timeout_seconds > 0
+            return normalize_metadata(source.platform, {"title": "Sample", "duration": 1,
+                "formats": [{"format_id": "audio-aac", "ext": "m4a", "vcodec": "none", "acodec": "aac"}]})
+
+    client = TestClient(routes.create_app(redis_client=context.redis, settings=context.settings,
+                                          platform_inspector=Inspector()))
+    inspected = client.post("/api/v1/media/inspect", json={"url": "https://youtu.be/AbCdEf12345"})
+    assert inspected.status_code == 201, inspected.text
+    source = inspected.json()
+    accepted = client.post("/api/v1/jobs", json={"source_id": source["source_id"],
+        "source_token": source["source_token"], "output_type": "audio", "output_format": "m4a"})
+    assert accepted.status_code == 202, accepted.text
+    return client, accepted.json()
+
+
+def local_acquirer(context):
+    class Acquirer:
+        calls = 0
+
+        def acquire(self, source, format_ids, selection, destination, *, max_bytes,
+                    deadline, progress, cancelled):
+            self.calls += 1
+            assert source.url == "https://www.youtube.com/watch?v=AbCdEf12345"
+            assert format_ids == ("audio-aac",)
+            assert selection["output_format"] == "m4a"
+            assert max_bytes <= context.settings.max_input_bytes
+            assert deadline > time.monotonic() and not cancelled()
+            path = destination / "tone.wav"
+            shutil.copyfile(context.settings.media_storage_dir.parent / "tone.wav", path)
+            progress(100)
+            return StagedMedia(path, path.name)
+
+    return Acquirer()
 
 
 def test_rq_entrypoints_match_api_task_arguments(context):
@@ -636,3 +678,85 @@ def test_abandoned_cancellation_is_recovered_by_worker(context, monkeypatch):
     run_job(context)
     assert record(context)["status"] == "cancelled"
     assert not job_dir(context).exists()
+
+
+def test_platform_fake_acquisition_converts_and_delivers(context, monkeypatch):
+    client, accepted = make_platform_job(context)
+    acquirer = local_acquirer(context)
+    monkeypatch.setattr(jobs, "platform_acquirer", acquirer)
+    jobs.process_media_job(accepted["job_id"])
+    saved = context.store.get(accepted["job_id"])
+    assert acquirer.calls == 1
+    assert saved["status"] == "completed" and saved["stage"] == "completed"
+    assert not (context.settings.media_storage_dir / "jobs" / accepted["job_id"] / "input").exists()
+    response = client.get(f"/api/v1/jobs/{accepted['job_id']}/download",
+                          headers={"authorization": f"Bearer {accepted['access_token']}"})
+    assert response.status_code == 200 and len(response.content) == saved["result"]["file_size"]
+
+
+def test_platform_acquisition_failure_cleans_partial(context, monkeypatch):
+    _, accepted = make_platform_job(context)
+
+    class Failing:
+        def acquire(self, _source, _formats, _selection, destination, **_kwargs):
+            (destination / ".partial").write_bytes(b"partial")
+            raise MediaError(ErrorCode.INVALID_MEDIA, "Broken local fixture")
+
+    monkeypatch.setattr(jobs, "platform_acquirer", Failing())
+    jobs.process_media_job(accepted["job_id"])
+    assert context.store.get(accepted["job_id"])["status"] == "failed"
+    assert not (context.settings.media_storage_dir / "jobs" / accepted["job_id"] / "input").exists()
+
+
+def test_platform_acquisition_observes_cancellation(context, monkeypatch):
+    _, accepted = make_platform_job(context)
+
+    class Cancelling:
+        def acquire(self, _source, _formats, _selection, destination, *, progress, cancelled, **_kwargs):
+            (destination / ".partial").write_bytes(b"partial")
+            context.store.cancel(accepted["job_id"])
+            assert cancelled()
+            progress(1)
+            pytest.fail("Acquisition did not stop after cancellation")
+
+    monkeypatch.setattr(jobs, "platform_acquirer", Cancelling())
+    jobs.process_media_job(accepted["job_id"])
+    assert context.store.get(accepted["job_id"])["status"] == "cancelled"
+    assert not (context.settings.media_storage_dir / "jobs" / accepted["job_id"]).exists()
+
+
+def test_platform_retry_discards_partial_before_reacquisition(context, monkeypatch):
+    _, accepted = make_platform_job(context)
+    successful = local_acquirer(context)
+
+    class Retrying:
+        attempts = 0
+
+        def acquire(self, source, format_ids, selection, destination, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                (destination / ".partial").write_bytes(b"partial")
+                raise MediaError(ErrorCode.PROCESSING_TIMEOUT, "Local timeout")
+            assert not (destination / ".partial").exists()
+            return successful.acquire(source, format_ids, selection, destination, **kwargs)
+
+    acquirer = Retrying()
+    monkeypatch.setattr(jobs, "platform_acquirer", acquirer)
+    with pytest.raises(RuntimeError, match="Transient media processing failure"):
+        jobs.process_media_job(accepted["job_id"])
+    assert context.store.get(accepted["job_id"])["status"] == "queued"
+    assert not (context.settings.media_storage_dir / "jobs" / accepted["job_id"] / "input").exists()
+    jobs.process_media_job(accepted["job_id"])
+    assert acquirer.attempts == 2
+    assert context.store.get(accepted["job_id"])["status"] == "completed"
+
+
+def test_platform_worker_rejects_tampered_snapshot(context, monkeypatch):
+    _, accepted = make_platform_job(context)
+    monkeypatch.setattr(jobs, "platform_acquirer", local_acquirer(context))
+    key = f"media:job:{accepted['job_id']}"
+    saved = json.loads(context.redis.get(key))
+    saved["platform_snapshot"]["url"] = "https://evil.example/private"
+    context.redis.records[key] = json.dumps(saved)
+    jobs.process_media_job(accepted["job_id"])
+    assert context.store.get(accepted["job_id"])["status"] == "failed"

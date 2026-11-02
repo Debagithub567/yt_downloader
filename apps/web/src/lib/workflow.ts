@@ -78,7 +78,7 @@ export function availableFormats(source: InspectedSource): OutputFormat[] {
   return [
     ...(source.video_options.length ? ["mp4" as const] : []),
     ...source.audio_options.filter((format) => format !== "original" ||
-      COPYABLE_AUDIO.has(source.media.audio_streams[0]?.codec)),
+      COPYABLE_AUDIO.has(source.media?.audio_streams[0]?.codec ?? "")),
   ];
 }
 

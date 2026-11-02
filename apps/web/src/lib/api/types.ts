@@ -37,9 +37,25 @@ export interface InspectedSource {
   source_id: string;
   source_token: string;
   expires_at: string;
-  media: MediaInfo;
+  media: MediaInfo | null;
   video_options: VideoOption[];
   audio_options: Array<"m4a" | "mp3" | "original">;
+  source_kind?: "upload" | "direct_url" | "platform";
+  platform?: "youtube" | "instagram" | "x" | null;
+  platform_inspection?: PlatformInspection | null;
+}
+
+export interface PlatformInspection {
+  source_url: string;
+  platform: "youtube" | "instagram" | "x";
+  title: string | null;
+  duration_seconds: number | null;
+  available_resolutions: number[];
+  has_audio: boolean;
+  estimated_source_size_bytes: number | null;
+  formats: Array<{ format_id: string; extension: string | null; video_codec: string | null;
+    audio_codec: string | null; width: number | null; height: number | null;
+    size_bytes: number | null; size_is_estimate: boolean }>;
 }
 
 export type SourceCapability = Pick<InspectedSource, "source_id" | "source_token">;

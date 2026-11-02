@@ -72,6 +72,28 @@ test("URL input is kept locally and sent to inspection with an abort signal", as
   assert.ok(calls.inspectUrl[0][1].signal instanceof AbortSignal);
 });
 
+test("metadata-only platform inspection offers saved output choices", async () => {
+  const platform = { ...inspection, media: null, source_kind: "platform", platform: "youtube",
+    platform_inspection: { source_url: "https://www.youtube.com/watch?v=AbCdEf12345",
+      platform: "youtube", title: null, duration_seconds: null, available_resolutions: [720],
+      has_audio: true, estimated_source_size_bytes: null, formats: [
+        { format_id: "video-720", extension: "mp4", video_codec: "h264", audio_codec: null,
+          width: 1280, height: 720, size_bytes: null, size_is_estimate: false },
+        { format_id: "audio-aac", extension: "m4a", video_codec: null, audio_codec: "aac",
+          width: null, height: null, size_bytes: null, size_is_estimate: false },
+      ] },
+    audio_options: ["m4a", "mp3"],
+    video_options: [{ resolution: 720, video_action: "transcode", audio_action: "transcode", output_format: "mp4" }] };
+  const { workflow, calls } = setup({ inspectUrl: async () => platform });
+  workflow.setUrl("https://youtu.be/AbCdEf12345");
+  await workflow.inspect();
+  assert.deepEqual(availableFormats(workflow.getSnapshot().inspection), ["mp4", "m4a", "mp3"]);
+  assert.equal(workflow.getSnapshot().resolution, 720);
+  await workflow.submit();
+  assert.equal(calls.createJob[0][1].output_format, "mp4");
+  assert.equal(calls.createJob[0][1].resolution, 720);
+});
+
 test("file selection sends the file and name to the raw-upload API helper", async () => {
   const { workflow, calls } = setup();
   const file = Object.assign(new Blob(["media"]), { name: "sample.mp4" });

@@ -20,12 +20,16 @@ from media_core.jobs import (JOB_ID_PATTERN, JobStore, cleanup_expired_job,
                              remove_storage_directory, safe_directory, update_expiration)
 from media_core.models import MediaInfo, ProcessRequest
 from media_core.names import safe_stem
+from media_core.platforms import PlatformAcquirer, source_from_snapshot
 from media_core.settings import Settings
 from media_core.sources import LocalFileSource
 from media_core.storage import sha256_file
 
 
 log = logging.getLogger(__name__)
+# Phase 5A.1 keeps production acquisition disabled. A network-safe implementation
+# can be supplied in 5A.2; tests inject a deterministic local acquirer.
+platform_acquirer: PlatformAcquirer | None = None
 TRANSIENT = frozenset({ErrorCode.PROCESSING_TIMEOUT, ErrorCode.PROBE_FAILED, ErrorCode.INTERNAL_ERROR})
 PUBLIC_ERRORS = {
     ErrorCode.INVALID_SOURCE: "The source is invalid",
@@ -121,6 +125,7 @@ def process_media_job(job_id: str) -> None:
                 finish_cancelled(claim_id)
             return
         filename = record["source_filename"]
+        platform_job = record.get("source_kind") == "platform"
         last = {"time": 0.0, "percent": -1, "stage": ""}
 
         def cancelled() -> bool:
@@ -129,7 +134,12 @@ def process_media_job(job_id: str) -> None:
                     or current["cancel_requested"] or current.get("claim_id") != claim_id)
 
         def progress(percent: int | None, stage: str) -> None:
-            stage = {"staging": "preparing", "inspecting": "preparing", "verifying": "finalizing"}.get(stage, stage)
+            if platform_job:
+                if stage in {"staging", "inspecting", "processing"}:
+                    stage = "converting"
+                    percent = min(99, 20 + int(percent * 0.79)) if percent is not None else None
+            else:
+                stage = {"staging": "preparing", "inspecting": "preparing", "verifying": "finalizing"}.get(stage, stage)
             now = time.monotonic()
             value = percent if percent is not None else last["percent"]
             if stage != last["stage"] or value > last["percent"] and now - last["time"] >= 0.5:
@@ -140,16 +150,49 @@ def process_media_job(job_id: str) -> None:
         try:
             if job_dir.is_symlink() or source_root.is_symlink() or output_root.is_symlink():
                 raise MediaError(ErrorCode.UNAUTHORIZED_SOURCE, "Job storage is unavailable")
+            shutdown_margin = min(30, max(1, settings.job_timeout_seconds // 10))
+            deadline = time.monotonic() + max(1, settings.job_timeout_seconds - shutdown_margin)
+            if platform_job:
+                snapshot = record.get("platform_snapshot")
+                source = source_from_snapshot(snapshot)
+                if platform_acquirer is None:
+                    raise MediaError(ErrorCode.INTERNAL_ERROR, "Platform acquisition is unavailable")
+                shutil.rmtree(source_root, ignore_errors=True)
+                source_root.mkdir(parents=True, exist_ok=False)
+                progress(None, "acquiring")
+
+                def acquisition_progress(percent: int | None) -> None:
+                    if cancelled():
+                        raise MediaError(ErrorCode.CANCELLED, "Processing was cancelled")
+                    progress(min(19, max(0, int(percent)) // 5) if percent is not None else None, "acquiring")
+
+                staged = platform_acquirer.acquire(
+                    source, tuple(snapshot["format_ids"]), record["request"], source_root,
+                    max_bytes=min(settings.max_input_bytes, settings.platform_max_source_bytes,
+                                  settings.platform_temp_disk_budget_bytes),
+                    deadline=deadline, progress=acquisition_progress, cancelled=cancelled,
+                )
+                if (not staged.filename or Path(staged.filename).name != staged.filename or
+                        "\\" in staged.filename or staged.path != source_root / staged.filename or
+                        staged.path.is_symlink()):
+                    raise MediaError(ErrorCode.UNAUTHORIZED_SOURCE, "Acquired media path is unsafe")
+                LocalFileSource(source_root, max_bytes=min(settings.max_input_bytes,
+                    settings.platform_max_source_bytes, settings.platform_temp_disk_budget_bytes)).validate(staged.filename)
+                if cancelled():
+                    raise MediaError(ErrorCode.CANCELLED, "Processing was cancelled")
+                if time.monotonic() >= deadline:
+                    raise MediaError(ErrorCode.PROCESSING_TIMEOUT, "Acquisition timed out")
+                filename = staged.filename
             request = ProcessRequest(
                 source_reference=filename, output_dir=output_root, **record["request"],
             )
             probe_timeout = min(20, max(1, settings.job_timeout_seconds // 6))
-            shutdown_margin = min(30, max(1, settings.job_timeout_seconds // 10))
+            remaining = max(1, int(deadline - time.monotonic()))
             engine = MediaEngine(EngineConfig(
                 max_output_bytes=settings.max_output_bytes,
                 probe_timeout_seconds=probe_timeout,
-                process_timeout_seconds=max(1, settings.job_timeout_seconds - 2 * probe_timeout - shutdown_margin),
-                total_timeout_seconds=max(1, settings.job_timeout_seconds - shutdown_margin),
+                process_timeout_seconds=max(1, remaining - 2 * probe_timeout),
+                total_timeout_seconds=remaining,
             ))
             if cancelled():
                 finish_cancelled(claim_id)
@@ -180,6 +223,8 @@ def process_media_job(job_id: str) -> None:
             shutil.rmtree(source_root, ignore_errors=True)
             log.info("Media job completed", extra={"job_id": job_id})
         except MediaError as error:
+            if platform_job:
+                shutil.rmtree(source_root, ignore_errors=True)
             if error.code == ErrorCode.CANCELLED or cancelled():
                 finish_cancelled(claim_id)
                 return
@@ -203,6 +248,8 @@ def process_media_job(job_id: str) -> None:
                 finish_cancelled(claim_id)
             log.warning("Media job failed", extra={"job_id": job_id, "code": error.code.value})
         except Exception:
+            if platform_job:
+                shutil.rmtree(source_root, ignore_errors=True)
             if published or manifest.is_file():
                 log.exception("Published result awaits Redis completion", extra={"job_id": job_id})
                 raise

@@ -67,6 +67,28 @@ test("URL inspection sends the real JSON request and parses capabilities", async
   assert.deepEqual(JSON.parse(calls[0].init.body), { url: "https://media.example/tone.m4a" });
 });
 
+test("platform inspection parses metadata without inventing a local media file", async () => {
+  const platform = {
+    ...inspection, media: null, source_kind: "platform", platform: "youtube",
+    video_options: [{ resolution: 720, video_action: "transcode", audio_action: "transcode", output_format: "mp4" }],
+    audio_options: ["m4a", "mp3"],
+    platform_inspection: {
+      source_url: "https://www.youtube.com/watch?v=AbCdEf12345", platform: "youtube",
+      title: null, duration_seconds: null, available_resolutions: [720], has_audio: true,
+      estimated_source_size_bytes: null,
+      formats: [{ format_id: "video-720", extension: "mp4", video_codec: "h264",
+        audio_codec: null, width: 1280, height: 720, size_bytes: null, size_is_estimate: false }],
+    },
+  };
+  const { api } = setup(json(platform, 201));
+  const result = await api.inspectUrl("https://youtu.be/AbCdEf12345");
+  assert.equal(result.media, null);
+  assert.equal(result.platform_inspection.title, null);
+  assert.equal(result.platform_inspection.formats[0].format_id, "video-720");
+  const tampered = setup(json({ ...platform, platform: "instagram" }, 201));
+  await assert.rejects(tampered.api.inspectUrl("https://youtu.be/AbCdEf12345"), isKind("invalid_response"));
+});
+
 test("file inspection uses raw octet-stream, not multipart, and sanitizes its header", async () => {
   const { api, calls } = setup(json(inspection, 201));
   const file = new Blob(["media"], { type: "audio/mp4" });

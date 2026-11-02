@@ -129,12 +129,12 @@ export default function Home() {
               <p>These details come from the inspected source.</p>
             </div></div>
             <dl className="details-grid">
-              <Detail term="Title">{state.inspection.media.title}</Detail>
-              <Detail term="Duration">{formatDuration(state.inspection.media.duration_seconds)}</Detail>
-              <Detail term="Container">{state.inspection.media.container ?? "Unknown"}</Detail>
-              <Detail term="Input size">{state.inspection.media.file_size === null ? "Unknown" : formatFileSize(state.inspection.media.file_size)}</Detail>
-              <Detail term="Video streams">{state.inspection.media.video_streams.map((stream) => `${stream.codec}${stream.width && stream.height ? ` ${stream.width}×${stream.height}` : ""}`).join(", ") || "None"}</Detail>
-              <Detail term="Audio streams">{state.inspection.media.audio_streams.map((stream) => stream.codec).join(", ") || "None"}</Detail>
+              <Detail term="Title">{state.inspection.media?.title ?? state.inspection.platform_inspection?.title ?? "Unavailable"}</Detail>
+              <Detail term="Duration">{formatDuration(state.inspection.media?.duration_seconds ?? state.inspection.platform_inspection?.duration_seconds ?? null)}</Detail>
+              <Detail term="Container">{state.inspection.media?.container ?? "Unknown"}</Detail>
+              <Detail term="Input size">{state.inspection.media?.file_size == null ? "Unknown" : formatFileSize(state.inspection.media.file_size)}</Detail>
+              <Detail term="Video streams">{state.inspection.media?.video_streams.map((stream) => `${stream.codec}${stream.width && stream.height ? ` ${stream.width}×${stream.height}` : ""}`).join(", ") ?? "Unreported"}</Detail>
+              <Detail term="Audio streams">{state.inspection.media?.audio_streams.map((stream) => stream.codec).join(", ") ?? "Unreported"}</Detail>
             </dl>
           </section>}
 

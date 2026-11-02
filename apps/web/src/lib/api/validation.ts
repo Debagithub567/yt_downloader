@@ -1,11 +1,12 @@
 import { apiFailure, safePublicMessage } from "./errors.ts";
-import type { AcceptedJob, AudioStream, InspectedSource, JobOutput, JobStatus, MediaInfo, VideoOption, VideoStream } from "./types.ts";
+import type { AcceptedJob, AudioStream, InspectedSource, JobOutput, JobStatus, MediaInfo, PlatformInspection, VideoOption, VideoStream } from "./types.ts";
 
 const IDENTIFIER = /^[0-9a-f]{32}$/;
 const LIFECYCLES = new Set(["queued", "processing", "completed", "failed", "cancelled"]);
 const REQUEST_FORMATS = new Set(["mp4", "m4a", "mp3", "original"]);
 const PUBLISHED_FORMATS = new Set(["mp4", "m4a", "mp3", "flac", "ogg", "opus", "wav"]);
 const AUDIO_OPTIONS = new Set(["m4a", "mp3", "original"]);
+const PLATFORMS = new Set(["youtube", "instagram", "x"]);
 
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw apiFailure.invalidResponse();
@@ -92,6 +93,40 @@ function videoOption(value: unknown): VideoOption {
   };
 }
 
+function platformInspection(value: unknown): PlatformInspection {
+  const item = record(value);
+  if (!PLATFORMS.has(item.platform as string) || !Array.isArray(item.formats) ||
+      item.formats.length > 64 || !Array.isArray(item.available_resolutions) ||
+      typeof item.has_audio !== "boolean") throw apiFailure.invalidResponse();
+  const formats = item.formats.map((value) => {
+    const format = record(value);
+    const formatId = text(format.format_id);
+    if (!/^[A-Za-z0-9_.-]{1,64}$/.test(formatId) || typeof format.size_is_estimate !== "boolean") {
+      throw apiFailure.invalidResponse();
+    }
+    return {
+      format_id: formatId,
+      extension: nullableOmitted(format.extension, text),
+      video_codec: nullableOmitted(format.video_codec, text),
+      audio_codec: nullableOmitted(format.audio_codec, text),
+      width: nullableOmitted(format.width, (value) => integer(value, 1)),
+      height: nullableOmitted(format.height, (value) => integer(value, 1)),
+      size_bytes: nullableOmitted(format.size_bytes, (value) => integer(value, 1)),
+      size_is_estimate: format.size_is_estimate,
+    };
+  });
+  return {
+    source_url: text(item.source_url),
+    platform: item.platform as PlatformInspection["platform"],
+    title: nullableOmitted(item.title, text),
+    duration_seconds: nullableOmitted(item.duration_seconds, (value) => number(value, 0)),
+    available_resolutions: item.available_resolutions.map((value) => integer(value, 1)),
+    has_audio: item.has_audio,
+    estimated_source_size_bytes: nullableOmitted(item.estimated_source_size_bytes, (value) => integer(value, 1)),
+    formats,
+  };
+}
+
 export function parseInspectedSource(value: unknown): InspectedSource {
   const item = record(value);
   if (!Array.isArray(item.video_options) || !Array.isArray(item.audio_options)) {
@@ -101,13 +136,26 @@ export function parseInspectedSource(value: unknown): InspectedSource {
     if (typeof option !== "string" || !AUDIO_OPTIONS.has(option)) throw apiFailure.invalidResponse();
     return option as InspectedSource["audio_options"][number];
   });
+  const kind = item.source_kind;
+  if (kind !== undefined && kind !== "upload" && kind !== "direct_url" && kind !== "platform") {
+    throw apiFailure.invalidResponse();
+  }
+  const platform = item.platform == null ? null : item.platform;
+  if (platform !== null && !PLATFORMS.has(platform as string)) throw apiFailure.invalidResponse();
+  const platformInfo = kind === "platform" ? platformInspection(item.platform_inspection) : null;
+  if (kind === "platform" && (item.media !== null || platform !== platformInfo?.platform)) {
+    throw apiFailure.invalidResponse();
+  }
   return {
     source_id: identifier(item.source_id),
     source_token: text(item.source_token),
     expires_at: text(item.expires_at),
-    media: mediaInfo(item.media),
+    media: kind === "platform" ? null : mediaInfo(item.media),
     video_options: item.video_options.map(videoOption),
     audio_options: audioOptions,
+    ...(kind ? { source_kind: kind } : {}),
+    ...(item.platform !== undefined ? { platform: platform as InspectedSource["platform"] } : {}),
+    ...(platformInfo ? { platform_inspection: platformInfo } : {}),
   };
 }
 

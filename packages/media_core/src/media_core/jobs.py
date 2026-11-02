@@ -249,11 +249,16 @@ class JobStore:
     def _job_key(job_id: str) -> str:
         return f"media:job:{job_id}"
 
-    def create_source(self, source_id: str, token: str, filename: str, media: dict) -> dict:
+    def create_source(self, source_id: str, token: str, filename: str | None, media: dict | None,
+                      *, source_kind: str = "upload", platform: str | None = None,
+                      platform_snapshot: dict | None = None,
+                      platform_selection: dict | None = None) -> dict:
         expires = time.time() + self.settings.source_ttl_seconds
         record = {
             "id": source_id, "token_hash": token_hash(token), "filename": filename,
             "media": media, "created_at": utc_now(),
+            "source_kind": source_kind, "platform": platform,
+            "platform_snapshot": platform_snapshot, "platform_selection": platform_selection,
             "expires_at": datetime.fromtimestamp(expires, timezone.utc).isoformat(),
             "expires_epoch": expires,
         }
@@ -274,7 +279,8 @@ class JobStore:
             return None
         return record
 
-    def create_job(self, job_id: str, token: str, source_id: str, filename: str, request: dict) -> dict:
+    def create_job(self, job_id: str, token: str, source_id: str, filename: str, request: dict,
+                   *, source_kind: str = "upload", platform_snapshot: dict | None = None) -> dict:
         now = time.time()
         expires = (
             now + self.settings.queue_wait_seconds
@@ -284,7 +290,9 @@ class JobStore:
         )
         record = {
             "id": job_id, "token_hash": token_hash(token), "source_id": source_id,
-            "source_filename": filename, "status": "queued", "stage": "queued", "progress": 0,
+            "source_filename": filename, "source_kind": source_kind,
+            "platform_snapshot": platform_snapshot,
+            "status": "queued", "stage": "queued", "progress": 0,
             "created_at": utc_now(), "updated_at": utc_now(),
             "expires_at": datetime.fromtimestamp(expires, timezone.utc).isoformat(),
             "expires_epoch": expires, "request": request, "attempts": 0,

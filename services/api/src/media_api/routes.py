@@ -6,6 +6,7 @@ import os
 import shutil
 import stat
 import time
+from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
 from typing import BinaryIO, Literal
@@ -13,6 +14,7 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from redis import Redis
 from rq import Queue, Retry
@@ -26,6 +28,9 @@ from media_core.jobs import (JOB_ID_PATTERN, JobStore, mark_expiration, new_id, 
                              remove_storage_directory, safe_directory, sweep_expired_storage)
 from media_core.models import MediaInfo, ProcessRequest, VideoOption
 from media_core.names import safe_stem
+from media_core.platforms import (PlatformInspection, PlatformInspector,
+                                  PlatformMetadata, SourceKind, classify_url,
+                                  platform_snapshot, source_from_snapshot)
 from media_core.probe import inspect_file
 from media_core.settings import Settings
 from media_core.sources import DirectURLSource, LocalFileSource
@@ -48,13 +53,38 @@ class JobRequest(BaseModel):
     audio_bitrate_kbps: int | None = None
 
 
+class PlatformFormatResponse(BaseModel):
+    format_id: str
+    extension: str | None
+    video_codec: str | None
+    audio_codec: str | None
+    width: int | None
+    height: int | None
+    size_bytes: int | None
+    size_is_estimate: bool
+
+
+class PlatformInspectionResponse(BaseModel):
+    source_url: str
+    platform: Literal["youtube", "instagram", "x"]
+    title: str | None
+    duration_seconds: float | None
+    available_resolutions: list[int]
+    has_audio: bool
+    estimated_source_size_bytes: int | None
+    formats: list[PlatformFormatResponse]
+
+
 class InspectResponse(BaseModel):
     source_id: str
     source_token: str
     expires_at: str
-    media: MediaInfo
+    media: MediaInfo | None
     video_options: list[VideoOption]
     audio_options: list[str]
+    source_kind: Literal["upload", "direct_url", "platform"]
+    platform: Literal["youtube", "instagram", "x"] | None = None
+    platform_inspection: PlatformInspectionResponse | None = None
 
 
 class JobAcceptedResponse(BaseModel):
@@ -103,6 +133,15 @@ def _media_error(error: MediaError) -> HTTPException:
     }.get(error.code, 400)
     message = "Media operation failed" if status == 503 else str(error)
     return HTTPException(status_code=status, detail={"code": error.code.value, "message": message})
+
+
+def _platform_options(metadata: PlatformMetadata) -> tuple[list[VideoOption], list[str]]:
+    native = max(metadata.available_resolutions, default=0)
+    videos = [VideoOption(resolution=height, video_action="transcode",
+                          audio_action="transcode" if metadata.has_audio else None)
+              for height in EngineConfig().resolutions if height <= native]
+    audio = ["m4a", "mp3"] if metadata.has_audio else []
+    return videos, audio
 
 
 def _bearer(authorization: str | None) -> str:
@@ -186,7 +225,8 @@ def _open_published_output(root: Path, job_id: str, result: dict) -> tuple[Binar
         raise HTTPException(status_code=410, detail="Completed file is unavailable") from error
 
 
-def create_app(*, redis_client: Redis | None = None, settings: Settings | None = None) -> FastAPI:
+def create_app(*, redis_client: Redis | None = None, settings: Settings | None = None,
+               platform_inspector: PlatformInspector | None = None) -> FastAPI:
     app = FastAPI(title="Media Downloader API", version="0.2.0")
     config = settings or Settings()
     connection = redis_client if redis_client is not None else Redis.from_url(config.redis_url)
@@ -218,6 +258,13 @@ def create_app(*, redis_client: Redis | None = None, settings: Settings | None =
         source_dir = safe_directory(root, "sources", source_id)
         created = False
         accepted = False
+        source_kind = SourceKind.UPLOAD
+        platform = None
+        platform_info = None
+        snapshot = None
+        selection = None
+        media = None
+        path = None
         try:
             source_dir.mkdir(parents=True, exist_ok=False)
             content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
@@ -230,10 +277,43 @@ def create_app(*, redis_client: Redis | None = None, settings: Settings | None =
                 try:
                     url = json.loads(body)["url"]
                 except (ValueError, TypeError, KeyError):
-                    raise HTTPException(status_code=400, detail="A direct media URL is required") from None
+                    raise HTTPException(status_code=400, detail="A media URL is required") from None
                 if not isinstance(url, str):
-                    raise HTTPException(status_code=400, detail="A direct media URL is required")
-                path = DirectURLSource(config.allowed_hosts, max_bytes=config.max_input_bytes).stage(url, source_dir).path
+                    raise HTTPException(status_code=400, detail="A media URL is required")
+                classified = classify_url(url)
+                source_kind, platform = classified.kind, classified.platform
+                if source_kind == SourceKind.PLATFORM:
+                    if platform_inspector is None:
+                        raise HTTPException(status_code=501, detail={
+                            "code": "platform_unavailable", "message": "Platform links are not available yet",
+                        })
+                    metadata = await run_in_threadpool(
+                        platform_inspector.inspect, classified,
+                        max_metadata_bytes=config.platform_metadata_max_bytes,
+                        timeout_seconds=config.platform_inspection_timeout_seconds,
+                    )
+                    if not isinstance(metadata, PlatformMetadata):
+                        raise MediaError(ErrorCode.INVALID_MEDIA, "Platform inspection is invalid")
+                    inspection = PlatformInspection(classified, metadata)
+                    snapshot = platform_snapshot(inspection)
+                    video, audio = _platform_options(metadata)
+                    selection = {"video_resolutions": [item.resolution for item in video],
+                                 "audio_options": audio}
+                    formats = [asdict(item) for item in metadata.formats]
+                    exact_muxed = [item.size_bytes for item in metadata.formats
+                                   if item.video_codec and item.audio_codec and not item.size_is_estimate]
+                    platform_info = {
+                        "source_url": classified.url, "platform": classified.platform.value,
+                        "title": metadata.title, "duration_seconds": metadata.duration_seconds,
+                        "available_resolutions": list(metadata.available_resolutions),
+                        "has_audio": metadata.has_audio,
+                        "estimated_source_size_bytes": exact_muxed[0] if len(formats) == 1 and len(exact_muxed) == 1 else None,
+                        "formats": formats,
+                    }
+                    if len(json.dumps(platform_info).encode("utf-8")) > config.platform_metadata_max_bytes:
+                        raise MediaError(ErrorCode.SIZE_LIMIT_EXCEEDED, "Platform metadata exceeds the size limit")
+                else:
+                    path = DirectURLSource(config.allowed_hosts, max_bytes=config.max_input_bytes).stage(url, source_dir).path
             elif content_type == "application/octet-stream":
                 length = request.headers.get("content-length")
                 if length and length.isdecimal() and int(length) > config.max_input_bytes:
@@ -259,8 +339,16 @@ def create_app(*, redis_client: Redis | None = None, settings: Settings | None =
                 LocalFileSource(source_dir, max_bytes=config.max_input_bytes).validate(path.name)
             else:
                 raise HTTPException(status_code=415, detail="Send application/json with url or application/octet-stream")
-            media = inspect_file(path)
-            record = store.create_source(source_id, source_token, path.name, media.model_dump())
+            if path is not None:
+                media = inspect_file(path)
+                video = list(video_options(media))
+                audio = ["m4a", "mp3", "original"] if media.audio_streams else []
+            record = store.create_source(
+                source_id, source_token, path.name if path is not None else None,
+                media.model_dump() if media is not None else None,
+                source_kind=source_kind.value, platform=platform.value if platform else None,
+                platform_snapshot=snapshot, platform_selection=selection,
+            )
             created = True
             mark_expiration(source_dir, record["expires_epoch"])
             scheduled = queue.enqueue_in(
@@ -272,9 +360,11 @@ def create_app(*, redis_client: Redis | None = None, settings: Settings | None =
             return {
                 "source_id": source_id, "source_token": source_token,
                 "expires_at": record["expires_at"],
-                "media": media.model_dump(),
-                "video_options": [option.model_dump() for option in video_options(media)],
-                "audio_options": ["m4a", "mp3", "original"] if media.audio_streams else [],
+                "media": media.model_dump() if media is not None else None,
+                "video_options": [option.model_dump() for option in video],
+                "audio_options": audio,
+                "source_kind": source_kind.value, "platform": platform.value if platform else None,
+                "platform_inspection": platform_info,
             }
         except (HTTPException, MediaError) as error:
             shutil.rmtree(source_dir, ignore_errors=True)
@@ -303,17 +393,38 @@ def create_app(*, redis_client: Redis | None = None, settings: Settings | None =
         if not source:
             raise HTTPException(status_code=403, detail="Source capability is invalid or expired")
         source_dir = safe_directory(root, "sources", body.source_id)
-        original = source_dir / source["filename"]
-        if not original.is_file() or not original.resolve().is_relative_to(source_dir):
-            raise HTTPException(status_code=410, detail="Source media has expired")
+        is_platform = source.get("source_kind") == SourceKind.PLATFORM
+        snapshot = source.get("platform_snapshot") if is_platform else None
+        if is_platform:
+            try:
+                classified = source_from_snapshot(snapshot)
+                if classified.platform.value != source.get("platform"):
+                    raise MediaError(ErrorCode.INVALID_SOURCE, "Platform source identity changed")
+            except MediaError as error:
+                raise _media_error(error) from error
+            if not source_dir.is_dir() or source_dir.is_symlink():
+                raise HTTPException(status_code=410, detail="Source inspection has expired")
+        else:
+            original = source_dir / source["filename"]
+            if not original.is_file() or not original.resolve().is_relative_to(source_dir):
+                raise HTTPException(status_code=410, detail="Source media has expired")
         job_id, access_token = new_id(), new_token()
         job_dir = safe_directory(root, "jobs", job_id)
         request_data = body.model_dump(exclude={"source_id", "source_token"})
-        processing = ProcessRequest(source_reference=source["filename"], output_dir=job_dir / "output", **request_data)
+        processing = ProcessRequest(source_reference=classified.url if is_platform else source["filename"],
+                                    output_dir=job_dir / "output", **request_data)
         engine = MediaEngine(EngineConfig(max_output_bytes=config.max_output_bytes))
         try:
             engine._validate(processing)
-            engine._plan(original, MediaInfo.model_validate(source["media"]), processing)
+            if is_platform:
+                offered = source.get("platform_selection") or {}
+                if body.output_type == "video":
+                    if body.resolution not in offered.get("video_resolutions", []):
+                        raise MediaError(ErrorCode.RESOLUTION_UNAVAILABLE, "Selected resolution is unavailable")
+                elif body.output_format not in offered.get("audio_options", []):
+                    raise MediaError(ErrorCode.INVALID_SOURCE, "Selected audio format is unavailable")
+            else:
+                engine._plan(original, MediaInfo.model_validate(source["media"]), processing)
         except MediaError as error:
             raise _media_error(error) from error
         except Exception:
@@ -325,13 +436,18 @@ def create_app(*, redis_client: Redis | None = None, settings: Settings | None =
         try:
             job_dir.mkdir(parents=True, exist_ok=False)
             directory_created = True
-            LocalFileSource(source_dir, max_bytes=config.max_input_bytes).stage(
-                source["filename"], job_dir / "input",
-            )
+            if not is_platform:
+                LocalFileSource(source_dir, max_bytes=config.max_input_bytes).stage(
+                    source["filename"], job_dir / "input",
+                )
             with connection.lock("media:queue:admission", timeout=15, blocking_timeout=3):
                 if len(queue) >= config.queue_capacity:
                     raise HTTPException(status_code=429, detail="Media queue is full")
-                record = store.create_job(job_id, access_token, body.source_id, source["filename"], request_data)
+                record = store.create_job(
+                    job_id, access_token, body.source_id, source["filename"] or "", request_data,
+                    source_kind=source.get("source_kind", SourceKind.UPLOAD),
+                    platform_snapshot=snapshot,
+                )
                 created = True
                 mark_expiration(job_dir, record["expires_epoch"])
                 scheduled = queue.enqueue_in(

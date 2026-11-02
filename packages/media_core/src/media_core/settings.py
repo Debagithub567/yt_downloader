@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     media_storage_dir: Path = Path("./data")
     media_allowed_hosts: str = ""
     max_input_bytes: int = 512 * 1024 * 1024
+    platform_metadata_max_bytes: int = 1024 * 1024
+    platform_inspection_timeout_seconds: int = 15
+    platform_max_source_bytes: int = 512 * 1024 * 1024
+    platform_temp_disk_budget_bytes: int = 512 * 1024 * 1024
     max_output_bytes: int = 1024 * 1024 * 1024
     source_ttl_seconds: int = 3600
     job_retention_seconds: int = 86400
@@ -24,4 +28,3 @@ class Settings(BaseSettings):
     @property
     def allowed_hosts(self) -> frozenset[str]:
         return frozenset(host.strip().lower() for host in self.media_allowed_hosts.split(",") if host.strip())
-

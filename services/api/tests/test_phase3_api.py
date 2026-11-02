@@ -12,6 +12,7 @@ from media_api import routes
 from media_core.errors import ErrorCode, MediaError
 from media_core.jobs import sweep_expired_storage
 from media_core.models import AudioStream, MediaInfo
+from media_core.platforms import normalize_metadata
 from media_core.settings import Settings
 from media_core.sources import StagedMedia
 from media_worker import main as worker_main
@@ -161,6 +162,104 @@ def test_authorized_url_inspection(api, monkeypatch):
     assert response.json()["media"]["audio_streams"][0]["codec"] == "aac"
     assert response.json()["audio_options"] == ["m4a", "mp3", "original"]
     assert api.queue.scheduled[0][1] == "media_worker.jobs.cleanup_source"
+
+
+def platform_client(api, *, empty=False):
+    class Inspector:
+        calls = []
+
+        def inspect(self, source, *, max_metadata_bytes, timeout_seconds):
+            self.calls.append((source, max_metadata_bytes, timeout_seconds))
+            assert max_metadata_bytes == 1024 * 1024
+            assert timeout_seconds == 15
+            return normalize_metadata(source.platform, {"formats": []} if empty else {
+                "title": "A clip", "duration": 12,
+                "formats": [
+                    {"format_id": "video-720", "ext": "mp4", "vcodec": "h264", "acodec": "none",
+                     "width": 1280, "height": 720},
+                    {"format_id": "audio-aac", "ext": "m4a", "vcodec": "none", "acodec": "aac"},
+                ],
+            })
+
+    inspector = Inspector()
+    settings = Settings(media_storage_dir=api.root, media_allowed_hosts="media.example",
+                        max_input_bytes=16, queue_capacity=1)
+    return TestClient(routes.create_app(redis_client=api.redis, settings=settings,
+                                        platform_inspector=inspector)), inspector
+
+
+def test_platform_is_disabled_without_an_inspector(api):
+    response = api.client.post("/api/v1/media/inspect", json={"url": "https://youtu.be/AbCdEf12345"})
+    assert response.status_code == 501
+    assert response.json()["detail"]["code"] == "platform_unavailable"
+    assert not list((api.root / "sources").iterdir())
+
+
+@pytest.mark.parametrize(("url", "provider"), [
+    ("https://youtu.be/AbCdEf12345", "youtube"),
+    ("https://instagram.com/reel/Cx12345ab/", "instagram"),
+    ("https://twitter.com/some_user/status/1234567890123456789", "x"),
+])
+def test_platform_inspection_is_metadata_only_and_identifies_provider(api, url, provider, monkeypatch):
+    client, inspector = platform_client(api)
+    monkeypatch.setattr(routes.DirectURLSource, "stage", lambda *_args, **_kwargs: pytest.fail("media download during inspection"))
+    response = client.post("/api/v1/media/inspect", json={"url": url})
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["source_kind"] == "platform" and body["platform"] == provider
+    assert body["media"] is None
+    assert body["platform_inspection"]["source_url"] == inspector.calls[0][0].url
+    assert body["platform_inspection"]["title"] == "A clip"
+    assert body["platform_inspection"]["available_resolutions"] == [720]
+    assert [item["format_id"] for item in body["platform_inspection"]["formats"]] == ["video-720", "audio-aac"]
+    assert [item["resolution"] for item in body["video_options"]] == [720, 480, 360]
+    assert body["audio_options"] == ["m4a", "mp3"]
+    source_dir = api.root / "sources" / body["source_id"]
+    assert [path.name for path in source_dir.iterdir()] == [".expires"]
+    record = json.loads(api.redis.get(f"media:source:{body['source_id']}"))
+    assert record["filename"] is None and record["media"] is None
+    assert record["platform_snapshot"]["url"] == body["platform_inspection"]["source_url"]
+
+
+def test_platform_submission_binds_selection_to_saved_source(api):
+    client, _ = platform_client(api)
+    inspected = client.post("/api/v1/media/inspect", json={"url": "https://youtu.be/AbCdEf12345"}).json()
+    source = {"source_id": inspected["source_id"], "source_token": inspected["source_token"]}
+    unsupported = client.post("/api/v1/jobs", json={**source, "output_type": "video",
+        "output_format": "mp4", "resolution": 1080})
+    assert unsupported.status_code == 400
+    assert not api.queue.enqueued
+    original = client.post("/api/v1/jobs", json={**source, "output_type": "audio",
+        "output_format": "original"})
+    assert original.status_code == 400
+    accepted = client.post("/api/v1/jobs", json={**source, "output_type": "video",
+        "output_format": "mp4", "resolution": 720, "url": "https://evil.example/private",
+        "platform": "instagram", "format_ids": ["evil"]})
+    assert accepted.status_code == 202, accepted.text
+    job = accepted.json()
+    record = json.loads(api.redis.get(f"media:job:{job['job_id']}"))
+    assert record["platform_snapshot"] == json.loads(api.redis.get(f"media:source:{source['source_id']}"))["platform_snapshot"]
+    assert record["source_filename"] == ""
+    assert record["request"] == {"output_type": "video", "output_format": "mp4",
+                                 "resolution": 720, "audio_bitrate_kbps": None}
+    assert not (api.root / "jobs" / job["job_id"] / "input").exists()
+    assert client.get(job["status_url"]).status_code == 401
+    assert client.get(job["status_url"], headers={"authorization": f"Bearer {job['access_token']}"}).status_code == 200
+
+
+def test_platform_missing_metadata_and_tampered_identity_fail_closed(api):
+    client, _ = platform_client(api, empty=True)
+    inspected = client.post("/api/v1/media/inspect", json={"url": "https://youtu.be/AbCdEf12345"}).json()
+    assert inspected["platform_inspection"]["title"] is None
+    assert inspected["platform_inspection"]["duration_seconds"] is None
+    assert inspected["video_options"] == [] and inspected["audio_options"] == []
+    source = {"source_id": inspected["source_id"], "source_token": inspected["source_token"]}
+    assert client.post("/api/v1/jobs", json={**source, "output_type": "audio", "output_format": "m4a"}).status_code == 400
+    key = f"media:source:{source['source_id']}"
+    record = json.loads(api.redis.get(key))
+    record["platform_snapshot"]["url"] = "https://evil.example/private"
+    api.redis.records[key] = json.dumps(record)
+    assert client.post("/api/v1/jobs", json={**source, "output_type": "audio", "output_format": "m4a"}).status_code == 400
 
 
 def test_streamed_upload_and_safe_filename(api):
